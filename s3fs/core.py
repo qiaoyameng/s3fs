@@ -1,14 +1,17 @@
 import asyncio
 import bisect
+from dataclasses import dataclass, field
 import errno
+from enum import Enum
 import io
 import logging
 import math
 import mimetypes
 import os
+import re
 import socket
 import weakref
-import re
+from typing import Any
 
 from urllib3.exceptions import IncompleteRead
 
@@ -70,6 +73,16 @@ S3_RETRYABLE_ERRORS = (
 )
 
 MAX_UPLOAD_PARTS = 10_000  # maximum number of parts for S3 multipart upload
+MAX_DELETE_OBJECTS = 1_000
+
+RETRYABLE_DELETE_ERROR_CODES = {
+    "InternalError",
+    "OperationAborted",
+    "RequestTimeout",
+    "ServiceUnavailable",
+    "SlowDown",
+}
+RETRYABLE_DELETE_HTTP_STATUS_CODES = {429, 500, 502, 503, 504}
 
 if ClientPayloadError is not None:
     S3_RETRYABLE_ERRORS += (ClientPayloadError,)
@@ -92,6 +105,142 @@ def add_retryable_error(exc):
     """
     global S3_RETRYABLE_ERRORS
     S3_RETRYABLE_ERRORS += (exc,)
+
+
+class DeleteStatus(str, Enum):
+    SUCCEEDED = "succeeded"
+    PERMANENTLY_REJECTED = "permanently_rejected"
+    RETRYABLE_FAILED = "retryable_failed"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class S3ObjectIdentifier:
+    """A specific S3 object, optionally pinned to one version."""
+
+    bucket: str
+    key: str
+    version_id: str | None = None
+    is_delete_marker: bool = False
+
+    @classmethod
+    def from_path(cls, fs, path):
+        bucket, key, version_id = fs.split_path(path)
+        return cls(bucket=bucket, key=key, version_id=version_id)
+
+    @property
+    def path(self):
+        path = f"{self.bucket}/{self.key}"
+        if self.version_id:
+            return f"{path}?versionId={self.version_id}"
+        return path
+
+    def request_object(self):
+        obj = {"Key": self.key}
+        if self.version_id and self.version_id != "null":
+            obj["VersionId"] = self.version_id
+        return obj
+
+
+@dataclass(frozen=True)
+class S3DeleteEntry:
+    """The outcome of attempting to delete one object version."""
+
+    identifier: S3ObjectIdentifier
+    status: DeleteStatus
+    code: str | None = None
+    message: str | None = None
+    delete_marker_created: bool = False
+    delete_marker_version_id: str | None = None
+    response_metadata: dict[str, Any] | None = None
+
+    @property
+    def bucket(self):
+        return self.identifier.bucket
+
+    @property
+    def key(self):
+        return self.identifier.key
+
+    @property
+    def version_id(self):
+        return self.identifier.version_id
+
+
+@dataclass(frozen=True)
+class S3DeleteOperationError:
+    """An error that cannot be attributed to one object version."""
+
+    stage: str
+    code: str | None
+    message: str
+    bucket: str | None = None
+    error: BaseException | None = None
+
+
+@dataclass
+class S3DeleteReport:
+    """Per-object results from one or more DeleteObjects calls."""
+
+    succeeded: list[S3DeleteEntry] = field(default_factory=list)
+    permanently_rejected: list[S3DeleteEntry] = field(default_factory=list)
+    retryable_failures: list[S3DeleteEntry] = field(default_factory=list)
+    unknown: list[S3DeleteEntry] = field(default_factory=list)
+    delete_markers: list[S3DeleteEntry] = field(default_factory=list)
+    operation_errors: list[S3DeleteOperationError] = field(default_factory=list)
+
+    @property
+    def ok(self):
+        return not self.failure_count
+
+    @property
+    def failure_count(self):
+        return (
+            len(self.permanently_rejected)
+            + len(self.retryable_failures)
+            + len(self.unknown)
+            + len(self.operation_errors)
+        )
+
+    @property
+    def retryable_identifiers(self):
+        return [
+            entry.identifier
+            for entry in self.retryable_failures
+            if entry.identifier.version_id
+        ]
+
+    @property
+    def deleted_paths(self):
+        return [entry.identifier.path for entry in self.succeeded]
+
+    def extend(self, other):
+        self.succeeded.extend(other.succeeded)
+        self.permanently_rejected.extend(other.permanently_rejected)
+        self.retryable_failures.extend(other.retryable_failures)
+        self.unknown.extend(other.unknown)
+        self.delete_markers.extend(other.delete_markers)
+        self.operation_errors.extend(other.operation_errors)
+
+    def _entry_status(self, status):
+        if status == DeleteStatus.SUCCEEDED:
+            return self.succeeded
+        if status == DeleteStatus.PERMANENTLY_REJECTED:
+            return self.permanently_rejected
+        if status == DeleteStatus.RETRYABLE_FAILED:
+            return self.retryable_failures
+        return self.unknown
+
+    def add_entry(self, entry):
+        if entry.status == DeleteStatus.SUCCEEDED:
+            self.succeeded.append(entry)
+        if entry.status == DeleteStatus.SUCCEEDED and (
+            entry.identifier.is_delete_marker
+            or entry.delete_marker_created
+        ):
+            self.delete_markers.append(entry)
+        elif entry.status != DeleteStatus.SUCCEEDED:
+            self._entry_status(entry.status).append(entry)
 
 
 CUSTOM_ERROR_HANDLER = lambda _: False
@@ -2342,6 +2491,177 @@ class S3FileSystem(AsyncFileSystem):
 
     clear_multipart_uploads = sync_wrapper(_clear_multipart_uploads)
 
+    @staticmethod
+    def _retryable_client_error(error):
+        response = getattr(error, "response", None) or {}
+        error_info = response.get("Error", {}) or {}
+        metadata = response.get("ResponseMetadata", {}) or {}
+        return (
+            error_info.get("Code") in RETRYABLE_DELETE_ERROR_CODES
+            or metadata.get("HTTPStatusCode") in RETRYABLE_DELETE_HTTP_STATUS_CODES
+        )
+
+    @staticmethod
+    def _as_bool(value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.lower() == "true"
+        return bool(value)
+
+    @staticmethod
+    def _client_error_code(error):
+        response = getattr(error, "response", None) or {}
+        return (response.get("Error", {}) or {}).get("Code") or type(error).__name__
+
+    @staticmethod
+    def _client_error_message(error):
+        response = getattr(error, "response", None) or {}
+        return (response.get("Error", {}) or {}).get("Message") or str(error)
+
+    @staticmethod
+    def _original_client_error(error):
+        seen = set()
+        while error is not None and id(error) not in seen:
+            seen.add(id(error))
+            if isinstance(error, ClientError):
+                return error
+            error = getattr(error, "__cause__", None)
+        return None
+
+    async def _bulk_delete_report(self, identifiers, quiet=False, **kwargs):
+        """Delete at most one S3 request's worth of object versions."""
+        if not identifiers:
+            return S3DeleteReport()
+
+        buckets = {identifier.bucket for identifier in identifiers}
+        if len(buckets) > 1:
+            raise ValueError("Bulk delete files should refer to only one bucket")
+        bucket = buckets.pop()
+        if len(identifiers) > MAX_DELETE_OBJECTS:
+            raise ValueError(
+                f"Max number of files to delete in one call is {MAX_DELETE_OBJECTS}"
+            )
+
+        report = S3DeleteReport()
+        delete_keys = {
+            "Objects": [identifier.request_object() for identifier in identifiers],
+            "Quiet": quiet,
+        }
+        for identifier in identifiers:
+            self.invalidate_cache(self._parent(identifier.path))
+
+        try:
+            out = await self._call_s3(
+                "delete_objects", kwargs, Bucket=bucket, Delete=delete_keys
+            )
+        except Exception as error:
+            client_error = self._original_client_error(error)
+            retryable = bool(
+                client_error and self._retryable_client_error(client_error)
+            )
+            for identifier in identifiers:
+                status = (
+                    DeleteStatus.RETRYABLE_FAILED
+                    if retryable and identifier.version_id
+                    else DeleteStatus.UNKNOWN
+                )
+                if client_error and not retryable:
+                    status = DeleteStatus.PERMANENTLY_REJECTED
+                report.add_entry(
+                    S3DeleteEntry(
+                        identifier=identifier,
+                        status=status,
+                        code=self._client_error_code(client_error)
+                        if client_error
+                        else type(error).__name__,
+                        message=self._client_error_message(client_error)
+                        if client_error
+                        else str(error),
+                        response_metadata=(
+                            getattr(client_error, "response", None) or {}
+                        ).get("ResponseMetadata", {})
+                        if client_error
+                        else None,
+                    )
+                )
+            return report
+
+        response_metadata = out.get("ResponseMetadata", {}) or {}
+        requested = {
+            (identifier.key, identifier.version_id): identifier
+            for identifier in identifiers
+        }
+        accounted = set()
+
+        for deleted in out.get("Deleted", []) or []:
+            raw_version_id = deleted.get("VersionId")
+            version_id = None if raw_version_id == "null" else raw_version_id
+            identifier = requested.get(
+                (deleted.get("Key"), version_id),
+                S3ObjectIdentifier(
+                    bucket=bucket,
+                    key=deleted["Key"],
+                    version_id=version_id,
+                    is_delete_marker=self._as_bool(deleted.get("DeleteMarker")),
+                ),
+            )
+            accounted.add((identifier.key, identifier.version_id))
+            report.add_entry(
+                S3DeleteEntry(
+                    identifier=identifier,
+                    status=DeleteStatus.SUCCEEDED,
+                    delete_marker_created=self._as_bool(deleted.get("DeleteMarker"))
+                    or self._as_bool(deleted.get("DeleteMarkerCreated")),
+                    delete_marker_version_id=deleted.get("DeleteMarkerVersionId"),
+                    response_metadata=response_metadata,
+                )
+            )
+
+        for error_info in out.get("Errors", []) or []:
+            raw_version_id = error_info.get("VersionId")
+            version_id = None if raw_version_id == "null" else raw_version_id
+            identifier = requested.get(
+                (error_info.get("Key"), version_id),
+                S3ObjectIdentifier(
+                    bucket=bucket, key=error_info["Key"], version_id=version_id
+                ),
+            )
+            accounted.add((identifier.key, identifier.version_id))
+            retryable = (
+                error_info.get("Code") in RETRYABLE_DELETE_ERROR_CODES
+                and bool(identifier.version_id)
+            )
+            report.add_entry(
+                S3DeleteEntry(
+                    identifier=identifier,
+                    status=DeleteStatus.RETRYABLE_FAILED
+                    if retryable
+                    else DeleteStatus.UNKNOWN
+                    if error_info.get("Code") in RETRYABLE_DELETE_ERROR_CODES
+                    else DeleteStatus.PERMANENTLY_REJECTED,
+                    code=error_info.get("Code"),
+                    message=error_info.get("Message"),
+                    response_metadata=response_metadata,
+                )
+            )
+
+        if not quiet:
+            for identity, identifier in requested.items():
+                if identity not in accounted:
+                    report.add_entry(
+                        S3DeleteEntry(
+                            identifier=identifier,
+                            status=DeleteStatus.UNKNOWN,
+                            code="IncompleteResponse",
+                            message="DeleteObjects did not return this object",
+                        )
+                    )
+
+        return report
+
+    bulk_delete_report = sync_wrapper(_bulk_delete_report)
+
     async def _bulk_delete(self, pathlist, **kwargs):
         """
         Remove multiple keys with one call
@@ -2360,23 +2680,121 @@ class S3FileSystem(AsyncFileSystem):
         bucket = buckets.pop()
         if len(pathlist) > 1000:
             raise ValueError("Max number of files to delete in one call is 1000")
-        delete_keys = {
-            "Objects": [{"Key": self.split_path(path)[1]} for path in pathlist],
-            "Quiet": True,
-        }
-        for path in pathlist:
-            self.invalidate_cache(self._parent(path))
-        out = await self._call_s3(
-            "delete_objects", kwargs, Bucket=bucket, Delete=delete_keys
+        identifiers = [S3ObjectIdentifier.from_path(self, path) for path in pathlist]
+        report = await self._bulk_delete_report(identifiers, quiet=True, **kwargs)
+        first_error = next(
+            iter(report.permanently_rejected + report.retryable_failures + report.unknown),
+            None,
         )
-        if out.get("Errors"):
-            error = out["Errors"][0]
-            # Preserve the complete response when only some objects failed.
-            exception = ClientError({**out, "Error": error}, "DeleteObjects")
+        if first_error is not None:
+            error_records = [
+                {
+                    "Key": entry.key,
+                    "VersionId": entry.version_id,
+                    "Code": entry.code,
+                    "Message": entry.message,
+                }
+                for entry in (
+                    report.permanently_rejected
+                    + report.retryable_failures
+                    + report.unknown
+                )
+            ]
+            response = {
+                "Errors": error_records,
+                "Error": error_records[0],
+                "ResponseMetadata": first_error.response_metadata
+                or {"HTTPStatusCode": 200},
+            }
+            exception = ClientError(response, "DeleteObjects")
             raise translate_boto_error(
-                exception, f"Failed to delete {bucket}/{error['Key']}: {exception}"
+                exception,
+                f"Failed to delete {first_error.identifier.path}: {exception}",
             )
-        return [f"{bucket}/{_['Key']}" for _ in out.get("Deleted", [])]
+        return [f"{bucket}/{identifier.key}" for identifier in identifiers]
+
+    async def _delete_identifiers(self, identifiers, quiet=False, **kwargs):
+        """Delete identifiers, splitting requests at the S3 batch limit."""
+        report = S3DeleteReport()
+        by_bucket = {}
+        for identifier in identifiers:
+            by_bucket.setdefault(identifier.bucket, []).append(identifier)
+        tasks = [
+            self._bulk_delete_report(chunk, quiet=quiet, **kwargs)
+            for bucket_identifiers in by_bucket.values()
+            for chunk in (
+                bucket_identifiers[i : i + MAX_DELETE_OBJECTS]
+                for i in range(0, len(bucket_identifiers), MAX_DELETE_OBJECTS)
+            )
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                report.operation_errors.append(
+                    S3DeleteOperationError(
+                        stage="delete",
+                        code=type(result).__name__,
+                        message=str(result),
+                        error=result,
+                    )
+                )
+            else:
+                report.extend(result)
+        return report
+
+    delete_identifiers = sync_wrapper(_delete_identifiers)
+
+    async def _delete_paths_report(self, pathlist, quiet=False, **kwargs):
+        paths = await self._expand_path(pathlist, recursive=False)
+        identifiers = [S3ObjectIdentifier.from_path(self, path) for path in paths]
+        return await self._delete_identifiers(identifiers, quiet=quiet, **kwargs)
+
+    delete_paths_report = sync_wrapper(_delete_paths_report)
+
+    async def _retry_deletions(self, report, quiet=False, **kwargs):
+        identifiers = report.retryable_identifiers
+        retry_report = await self._delete_identifiers(
+            identifiers, quiet=quiet, **kwargs
+        )
+
+        retried = {
+            (identifier.bucket, identifier.key, identifier.version_id)
+            for identifier in identifiers
+        }
+
+        def was_retried(entry):
+            return (
+                entry.bucket,
+                entry.key,
+                entry.version_id,
+            ) in retried
+
+        report.succeeded = [
+            entry
+            for entry in report.succeeded + retry_report.succeeded
+            if not was_retried(entry) or entry in retry_report.succeeded
+        ]
+        report.delete_markers = [
+            entry
+            for entry in report.delete_markers + retry_report.delete_markers
+            if not was_retried(entry) or entry in retry_report.delete_markers
+        ]
+        report.permanently_rejected = [
+            entry
+            for entry in report.permanently_rejected
+            + retry_report.permanently_rejected
+            if not was_retried(entry) or entry in retry_report.permanently_rejected
+        ]
+        report.unknown = [
+            entry
+            for entry in report.unknown + retry_report.unknown
+            if not was_retried(entry) or entry in retry_report.unknown
+        ]
+        report.retryable_failures = retry_report.retryable_failures
+        report.operation_errors = list(retry_report.operation_errors)
+        return retry_report
+
+    retry_deletions = sync_wrapper(_retry_deletions)
 
     async def _rm_file(self, path, **kwargs):
         bucket, key, _ = self.split_path(path)
@@ -2387,25 +2805,73 @@ class S3FileSystem(AsyncFileSystem):
         except ClientError as e:
             raise translate_boto_error(e)
 
-    async def _rm(self, path, recursive=False, **kwargs):
+    async def _rm(self, path, recursive=False, return_report=False, **kwargs):
+        """Delete paths, optionally returning one result per object version.
+
+        Use ``return_report=True`` to receive an :class:`S3DeleteReport`
+        instead of raising after the first failed object. Retry failures with
+        :meth:`retry_deletions`; only object versions with explicit version IDs
+        are retried, so a later object created with the same key is not deleted.
+        """
+        versioned_report = None
         if recursive and isinstance(path, str):
             bucket, key, _ = self.split_path(path)
             if not key and await self._is_bucket_versioned(bucket):
                 # special path to completely remove versioned bucket
-                await self._rm_versioned_bucket_contents(bucket)
+                if return_report:
+                    versioned_report = await self._rm_versioned_bucket_contents_report(
+                        bucket
+                    )
+                    if versioned_report.ok:
+                        await self._rmdir(bucket)
+                    self.invalidate_cache(bucket)
+                    self.invalidate_cache("")
+                    return versioned_report
+                else:
+                    await self._rm_versioned_bucket_contents(bucket)
         paths = await self._expand_path(path, recursive=recursive)
         files = [p for p in paths if self.split_path(p)[1]]
         dirs = [p for p in paths if not self.split_path(p)[1]]
+        if return_report:
+            report = versioned_report or S3DeleteReport()
+            if files:
+                identifiers = [
+                    S3ObjectIdentifier.from_path(self, file_path) for file_path in files
+                ]
+                report.extend(
+                    await self._delete_identifiers(identifiers, quiet=False, **kwargs)
+                )
+            for path_entry in paths:
+                self.invalidate_cache(path_entry)
+                self.invalidate_cache(self._parent(path_entry))
+            if report.ok:
+                results = await asyncio.gather(
+                    *[self._rmdir(directory) for directory in dirs],
+                    return_exceptions=True,
+                )
+                for directory, result in zip(dirs, results):
+                    if isinstance(result, BaseException):
+                        report.operation_errors.append(
+                            S3DeleteOperationError(
+                                stage="rmdir",
+                                code=type(result).__name__,
+                                message=str(result),
+                                bucket=self.split_path(directory)[0],
+                                error=result,
+                            )
+                        )
+            return report
+
         # TODO: fails if more than one bucket in list
         out = await _run_coros_in_chunks(
             [
-                self._bulk_delete(files[i : i + 1000])
-                for i in range(0, len(files), 1000)
+                self._bulk_delete(files[i : i + MAX_DELETE_OBJECTS])
+                for i in range(0, len(files), MAX_DELETE_OBJECTS)
             ],
             batch_size=3,
             nofiles=True,
         )
-        await asyncio.gather(*[self._rmdir(d) for d in dirs])
+        await asyncio.gather(*[self._rmdir(directory) for directory in dirs])
         [
             (self.invalidate_cache(p), self.invalidate_cache(self._parent(p)))
             for p in paths
@@ -2430,20 +2896,83 @@ class S3FileSystem(AsyncFileSystem):
 
     make_bucket_versioned = sync_wrapper(_make_bucket_versioned)
 
+    async def _rm_versioned_bucket_contents_report(self, bucket):
+        """Remove versions and delete markers, retaining each confirmed result."""
+        report = S3DeleteReport()
+        pages = self._list_pages(
+            "list_object_versions", Bucket=bucket, **self.req_kw
+        )
+        while True:
+            try:
+                page = await pages.__anext__()
+            except StopAsyncIteration:
+                break
+            except Exception as error:
+                report.operation_errors.append(
+                    S3DeleteOperationError(
+                        stage="list_object_versions",
+                        code=self._client_error_code(error)
+                        if isinstance(error, ClientError)
+                        else type(error).__name__,
+                        message=self._client_error_message(error)
+                        if isinstance(error, ClientError)
+                        else str(error),
+                        bucket=bucket,
+                        error=error,
+                    )
+                )
+                break
+
+            identifiers = [
+                S3ObjectIdentifier(
+                    bucket=bucket,
+                    key=item["Key"],
+                    version_id=item["VersionId"],
+                    is_delete_marker=False,
+                )
+                for item in page.get("Versions", []) or []
+            ] + [
+                S3ObjectIdentifier(
+                    bucket=bucket,
+                    key=item["Key"],
+                    version_id=item["VersionId"],
+                    is_delete_marker=True,
+                )
+                for item in page.get("DeleteMarkers", []) or []
+            ]
+            if identifiers:
+                report.extend(
+                    await self._delete_identifiers(identifiers, quiet=False)
+                )
+        return report
+
     async def _rm_versioned_bucket_contents(self, bucket):
         """Remove a versioned bucket and all contents"""
-        async for plist in self._list_pages(
-            "list_object_versions", Bucket=bucket, **self.req_kw
-        ):
-            obs = plist.get("Versions", []) + plist.get("DeleteMarkers", [])
-            delete_keys = {
-                "Objects": [
-                    {"Key": i["Key"], "VersionId": i["VersionId"]} for i in obs
-                ],
-                "Quiet": True,
-            }
-            if obs:
-                await self._call_s3("delete_objects", Bucket=bucket, Delete=delete_keys)
+        report = await self._rm_versioned_bucket_contents_report(bucket)
+        if report.ok:
+            return
+        first_error = next(
+            iter(
+                report.permanently_rejected
+                + report.retryable_failures
+                + report.unknown
+            ),
+            None,
+        )
+        if first_error is not None:
+            exception = ClientError(
+                {
+                    "Error": {
+                        "Key": first_error.key,
+                        "VersionId": first_error.version_id,
+                        "Code": first_error.code,
+                        "Message": first_error.message,
+                    }
+                },
+                "DeleteObjects",
+            )
+            raise translate_boto_error(exception)
+        raise translate_boto_error(report.operation_errors[0].error)
 
     def invalidate_cache(self, path=None):
         if path is None:
