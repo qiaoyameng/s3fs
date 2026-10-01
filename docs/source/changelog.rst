@@ -4,6 +4,9 @@ Changelog
 Unreleased
 ----------
 
+- read-only ``as_of`` view of versioned buckets: per-key selection of the
+  newest version or delete marker at or before a cutoff time, applied
+  consistently by ``ls``, ``info``, ``open`` and the key-value mapper
 - Raise translated errors when S3 reports per-object failures for bulk deletes (#838)
 
 2026.9.0
