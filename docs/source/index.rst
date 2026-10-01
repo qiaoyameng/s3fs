@@ -373,6 +373,19 @@ The ``s3.utils.SSEParams`` provides some convenient helpers for the serverside
 encryption parameters in particular.  An instance can be passed instead of a
 regular python dictionary as the ``s3_additional_kwargs`` parameter.
 
+For SSE-C objects belonging to different customers, use
+``sse_customer_key_provider`` instead of one filesystem-wide key.  The callable
+receives ``(operation, bucket, key, version_id)``, where operation is
+``"read"`` or ``"write"``.  It can return the SSE-C parameters as a dictionary
+(or a coroutine for asynchronous implementations).  Copies resolve the source
+decryption key and destination encryption key independently.
+
+.. code-block:: python
+
+   >>> def customer_key(operation, bucket, key, version_id=None):
+   ...     return {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": ...}
+   >>> s3 = s3fs.S3FileSystem(sse_customer_key_provider=customer_key)
+
 
 Bucket Version Awareness
 ------------------------

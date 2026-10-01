@@ -23,6 +23,7 @@ API
    S3FileSystem.touch
 
 .. autosummary::
+   SSECustomerKeyContext
    S3File
    S3File.close
    S3File.flush
@@ -46,6 +47,8 @@ API
 .. autoclass:: S3File
    :members:
    :inherited-members:
+
+.. autoclass:: SSECustomerKeyContext
 
 .. currentmodule:: s3fs.mapping
 
