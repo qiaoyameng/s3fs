@@ -396,6 +396,29 @@ to the same object.
 In order for this to function the user must have the necessary IAM permissions to perform
 a GetObjectVersion
 
+Point-in-time views
+-------------------
+
+On a version-aware filesystem, ``as_of()`` returns a read-only view of the
+bucket(s) as they appeared at a given moment. For every key, the last version
+written at or before the cutoff is selected; keys whose latest entry at the
+cutoff is a delete marker are hidden. ``ls``, ``info``, ``open``, ``cat`` and
+mappings created with ``get_mapper`` on the view all follow this selection,
+and any attempt to write through the view raises ``OSError``.
+
+.. code-block:: python
+
+   >>> s3 = s3fs.S3FileSystem(version_aware=True)
+   >>> snapshot = s3.as_of('2024-01-31T12:00:00Z')
+   >>> snapshot.ls('versioned_bucket/path')
+   >>> with snapshot.open('versioned_bucket/object') as fo:
+   ...     data = fo.read()
+
+Note that S3 reports version timestamps with one-second granularity and does
+not expose the relative order of a version and a delete marker sharing an
+identical timestamp; such rare ties are resolved deterministically by
+treating the object version as newer than the delete marker.
+
 
 Contents
 ========

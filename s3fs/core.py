@@ -1,5 +1,6 @@
 import asyncio
 import bisect
+import datetime
 import errno
 import io
 import logging
@@ -24,6 +25,7 @@ from fsspec.asyn import (
     _run_coros_in_chunks,
 )
 from fsspec.callbacks import _DEFAULT_CALLBACK
+from fsspec.dircache import DirCache
 
 import aiobotocore
 import botocore
@@ -244,6 +246,44 @@ def _coalesce_version_id(*args):
         return version_ids.pop()
 
 
+def _coerce_as_of_timestamp(value):
+    """Normalize an as_of cutoff to a timezone-aware UTC datetime.
+
+    Accepts ``datetime`` instances (naive ones are assumed to be UTC) and
+    ISO-8601 strings, e.g. ``"2024-01-31T12:00:00Z"``.
+    """
+    if isinstance(value, str):
+        value = datetime.datetime.fromisoformat(value)
+    if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.timezone.utc)
+        return value.astimezone(datetime.timezone.utc)
+    raise TypeError(
+        "as_of timestamp must be a datetime or ISO-8601 string, "
+        f"not {type(value).__name__}"
+    )
+
+
+def _merge_version_page(versions, delete_markers):
+    """Merge one page of list_object_versions output into a single stream.
+
+    S3 returns object versions and delete markers in two separate lists, each
+    sorted by (key, LastModified descending). We re-merge them with a stable
+    sort so that per-list server order is preserved. Note that S3 does not
+    expose the relative order of a version and a delete marker written with
+    identical (key, LastModified); in that rare case the object version is
+    treated as the newer entry here (see ``S3FileSystem.as_of``).
+    """
+    entries = [(False, v) for v in versions]
+    entries += [(True, m) for m in delete_markers]
+    # stable sorts: first by LastModified descending, then by key ascending,
+    # giving (key asc, LastModified desc); ties keep the server order within
+    # each list, versions before markers
+    entries.sort(key=lambda item: item[1]["LastModified"], reverse=True)
+    entries.sort(key=lambda item: item[1]["Key"])
+    return entries
+
+
 def calculate_chunksize(filesize, chunksize=None, max_parts=MAX_UPLOAD_PARTS) -> int:
     if chunksize is None:
         chunksize = 50 * 2**20  # default chunksize set to 50 MiB
@@ -419,6 +459,9 @@ class S3FileSystem(AsyncFileSystem):
         self.default_fill_cache = default_fill_cache
         self.default_cache_type = default_cache_type
         self.version_aware = version_aware
+        # Cutoff timestamp when this instance is a read-only as_of view
+        # (created via ``S3FileSystem.as_of``); None for a normal filesystem.
+        self._as_of = None
         self.client_kwargs = client_kwargs or {}
         self.config_kwargs = config_kwargs or {}
         self.requester_pays = requester_pays
@@ -833,6 +876,17 @@ class S3FileSystem(AsyncFileSystem):
                 "is not version aware"
             )
 
+        if self._as_of is not None:
+            if "r" not in mode:
+                self._check_writable()
+            if version_id is None:
+                bucket, key, path_version_id = self.split_path(path)
+                version_id = path_version_id or sync(
+                    self.loop, self._select_version_id_as_of, bucket, key
+                )
+                if version_id is None:
+                    raise FileNotFoundError(path)
+
         if cache_type is None:
             cache_type = self.default_cache_type
 
@@ -874,13 +928,22 @@ class S3FileSystem(AsyncFileSystem):
                 logger.debug("Get directory listing page for %s" % path)
                 dirs = []
                 files = []
-                async for c in self._iterdir(
-                    bucket,
-                    max_items=max_items,
-                    delimiter=delimiter,
-                    prefix=prefix,
-                    versions=versions,
-                ):
+                if self._as_of is not None:
+                    iterdir = self._iterdir_as_of(
+                        bucket,
+                        max_items=max_items,
+                        delimiter=delimiter,
+                        prefix=prefix,
+                    )
+                else:
+                    iterdir = self._iterdir(
+                        bucket,
+                        max_items=max_items,
+                        delimiter=delimiter,
+                        prefix=prefix,
+                        versions=versions,
+                    )
+                async for c in iterdir:
                     if c["type"] == "directory":
                         dirs.append(c)
                     else:
@@ -938,6 +1001,89 @@ class S3FileSystem(AsyncFileSystem):
                     yield c
             if remaining is not None and remaining <= 0:
                 return
+
+    async def _iterdir_as_of(self, bucket, max_items=None, delimiter="/", prefix=""):
+        """Iterate over the directory as visible at ``self._as_of``.
+
+        For each key, the last version written at or before than the cutoff is
+        yielded; keys whose latest entry at the cutoff is a delete marker
+        (or which did not exist yet) are skipped. A key's version history
+        may be split across response pages, so a key is only finalized once
+        the listing moves on to the next key.
+        """
+        kwargs = dict(Bucket=bucket, Prefix=prefix, Delimiter=delimiter, **self.req_kw)
+        remaining = max_items
+        current_key = None
+        chosen = None  # (is_delete_marker, entry) selected for current_key
+        async for page in self._list_pages("list_object_versions", **kwargs):
+            for l in page.get("CommonPrefixes", []):
+                c = {
+                    "Key": l["Prefix"][:-1],
+                    "Size": 0,
+                    "StorageClass": "DIRECTORY",
+                    "type": "directory",
+                }
+                self._fill_info(c, bucket, versions=False)
+                yield c
+                if remaining is not None:
+                    remaining -= 1
+            entries = _merge_version_page(
+                page.get("Versions", []), page.get("DeleteMarkers", [])
+            )
+            for is_delete_marker, entry in entries:
+                if entry["Key"] != current_key:
+                    # the previous key's history is complete: only now may
+                    # we conclude which version (if any) was visible
+                    if chosen is not None and not chosen[0]:
+                        c = dict(chosen[1])
+                        c["type"] = "file"
+                        self._fill_info(c, bucket, versions=False)
+                        yield c
+                        if remaining is not None:
+                            remaining -= 1
+                    current_key = entry["Key"]
+                    chosen = None
+                if chosen is None and entry["LastModified"] <= self._as_of:
+                    # entries are newest-first per key, so the first entry
+                    # at or before the cutoff is the visible one
+                    chosen = (is_delete_marker, entry)
+                if remaining is not None and remaining <= 0:
+                    return
+        if chosen is not None and not chosen[0]:
+            c = dict(chosen[1])
+            c["type"] = "file"
+            self._fill_info(c, bucket, versions=False)
+            yield c
+
+    async def _select_version_as_of(self, bucket, key):
+        """Pick the entry visible for one exact key at ``self._as_of``.
+
+        Returns ``(entry, is_delete_marker)`` for the last version or delete
+        marker written at or before the cutoff, or ``None`` if the key did
+        not exist yet at that time.
+        """
+        kwargs = dict(Bucket=bucket, Prefix=key, Delimiter="", **self.req_kw)
+        async for page in self._list_pages("list_object_versions", **kwargs):
+            entries = _merge_version_page(
+                page.get("Versions", []), page.get("DeleteMarkers", [])
+            )
+            for is_delete_marker, entry in entries:
+                if entry["Key"] != key:
+                    if entry["Key"] > key:
+                        # keys arrive in ascending order; the exact key is
+                        # fully behind us (its history may span pages)
+                        return None
+                    continue
+                if entry["LastModified"] <= self._as_of:
+                    return entry, is_delete_marker
+        return None
+
+    async def _select_version_id_as_of(self, bucket, key):
+        """VersionId of ``key`` at ``self._as_of`` or None if not visible."""
+        selected = await self._select_version_as_of(bucket, key)
+        if selected is None or selected[1]:
+            return None
+        return selected[0].get("VersionId")
 
     async def _list_pages(self, method, **kwargs):
         # Each page goes through _call_s3, so a transient error on one page is
@@ -1105,6 +1251,7 @@ class S3FileSystem(AsyncFileSystem):
     find = sync_wrapper(_find)
 
     async def _mkdir(self, path, acl=False, create_parents=True, **kwargs):
+        self._check_writable()
         path = self._strip_protocol(path).rstrip("/")
         if not path:
             raise ValueError
@@ -1142,6 +1289,7 @@ class S3FileSystem(AsyncFileSystem):
     mkdir = sync_wrapper(_mkdir)
 
     async def _makedirs(self, path, exist_ok=False):
+        self._check_writable()
         try:
             await self._mkdir(path, create_parents=True)
         except FileExistsError:
@@ -1153,6 +1301,7 @@ class S3FileSystem(AsyncFileSystem):
     makedirs = sync_wrapper(_makedirs)
 
     async def _rmdir(self, path):
+        self._check_writable()
         bucket, key, _ = self.split_path(path)
         if key:
             if await self._exists(path):
@@ -1295,6 +1444,7 @@ class S3FileSystem(AsyncFileSystem):
 
     async def _touch(self, path, truncate=True, data=None, **kwargs):
         """Create empty file or truncate"""
+        self._check_writable()
         bucket, key, version_id = self.split_path(path)
         if version_id:
             raise ValueError("S3 does not support touching existing versions of files")
@@ -1321,6 +1471,10 @@ class S3FileSystem(AsyncFileSystem):
         max_concurrency=None,
     ):
         bucket, key, vers = self.split_path(path)
+        if self._as_of is not None and version_id is None and vers is None:
+            version_id = await self._select_version_id_as_of(bucket, key)
+            if version_id is None:
+                raise FileNotFoundError(path)
         if start is not None or end is not None:
             head = {"Range": await self._process_limits(path, start, end)}
         else:
@@ -1413,6 +1567,7 @@ class S3FileSystem(AsyncFileSystem):
         mode=="create", exclusive write, is only known to work on AWS S3, and
         requires botocore>1.35.20
         """
+        self._check_writable()
         bucket, key, _ = self.split_path(path)
         concurrency = max_concurrency or self.max_concurrency
         size = len(data)
@@ -1482,6 +1637,7 @@ class S3FileSystem(AsyncFileSystem):
         mode=="create", exclusive write, is only known to work on AWS S3, and
         requires botocore>1.35.20
         """
+        self._check_writable()
         bucket, key, _ = self.split_path(rpath)
         if os.path.isdir(lpath):
             if key:
@@ -1756,6 +1912,8 @@ class S3FileSystem(AsyncFileSystem):
                     if out:
                         return out[0]
                     return {"name": path, "size": 0, "type": "directory"}
+        if self._as_of is not None:
+            return await self._info_as_of(path, bucket, key, version_id=version_id)
         if key:
             try:
                 out = await self._call_s3(
@@ -1820,6 +1978,54 @@ class S3FileSystem(AsyncFileSystem):
             raise translate_boto_error(e, set_cause=False)
         except ParamValidationError as e:
             raise ValueError("Failed to list path %r: %s" % (path, e))
+
+    async def _info_as_of(self, path, bucket, key, version_id=None):
+        """Info for a path in an as_of view.
+
+        Files resolve to the version visible at the cutoff; directories are
+        detected from the as_of listing below the path.
+        """
+        if not key:
+            return {
+                "name": bucket,
+                "type": "directory",
+                "size": 0,
+                "StorageClass": "DIRECTORY",
+            }
+        if version_id is None:
+            version_id = await self._select_version_id_as_of(bucket, key)
+        if version_id is not None:
+            try:
+                out = await self._call_s3(
+                    "head_object",
+                    self.kwargs,
+                    Bucket=bucket,
+                    Key=key,
+                    **version_id_kw(version_id),
+                )
+                return {
+                    "ETag": out.get("ETag", ""),
+                    "LastModified": out.get("LastModified", ""),
+                    "size": out["ContentLength"],
+                    "name": "/".join([bucket, key]),
+                    "type": "file",
+                    "StorageClass": out.get("StorageClass", "STANDARD"),
+                    "VersionId": out.get("VersionId"),
+                    "ContentType": out.get("ContentType"),
+                }
+            except ClientError as e:
+                raise translate_boto_error(e, set_cause=False)
+        # not a file at the cutoff; it may still be a directory prefix
+        async for _ in self._iterdir_as_of(
+            bucket, max_items=1, prefix=key.rstrip("/") + "/"
+        ):
+            return {
+                "name": "/".join([bucket, key]),
+                "type": "directory",
+                "size": 0,
+                "StorageClass": "DIRECTORY",
+            }
+        raise FileNotFoundError(path)
 
     async def _checksum(self, path, refresh=False):
         """
@@ -1910,6 +2116,81 @@ class S3FileSystem(AsyncFileSystem):
         return versions
 
     object_version_info = sync_wrapper(_object_version_info)
+
+    def as_of(self, timestamp):
+        """Return a read-only view of this filesystem at a point in time.
+
+        The view shows, for every key, the last version (or delete marker)
+        written at or before ``timestamp``: keys whose latest entry at the
+        cutoff is a delete marker are hidden, exactly as they appeared to a
+        non-versioned client at that moment. ``ls``, ``info``, ``open``,
+        ``cat`` and ``FSMap`` (``get_mapper``) on the view all follow this
+        same per-key selection. Any attempt to write, delete or modify
+        through the view raises ``OSError`` (``errno.EROFS``).
+
+        The selection is computed from ``list_object_versions`` and is
+        accumulated across result pages, since a page boundary may split
+        the version history of a single key.
+
+        Parameters
+        ----------
+        timestamp : datetime or str
+            Cutoff time (inclusive). Naive datetimes are assumed to be UTC;
+            ISO-8601 strings are also accepted.
+
+        Notes
+        -----
+        Requires ``version_aware=True``. S3 orders the versions of a key by
+        LastModified descending, but reports LastModified with one-second
+        granularity and returns versions and delete markers in separate
+        lists, so the relative order of a version and a delete marker
+        sharing an identical (key, LastModified) is not exposed by the API.
+        Such ties are resolved deterministically by treating the object
+        version as newer than the delete marker; within each list the
+        server-provided stable order is preserved.
+        """
+        if not self.version_aware:
+            raise ValueError(
+                "as_of views require a version-aware filesystem "
+                "(version_aware=True)"
+            )
+        # NB: copy.copy() would go through __reduce__ and the fsspec
+        # instance cache, potentially returning this very instance; allocate
+        # a bare object and shallow-copy the state (session, clients, config)
+        # instead. The view shares the connection but gets its own cache.
+        view = object.__new__(type(self))
+        view.__dict__.update(self.__dict__)
+        # the copied __dict__ contains sync-method wrappers (ls, info, ...)
+        # bound to *this* instance; re-mirror them against the view
+        if self.async_impl and self.mirror_sync_methods:
+            from fsspec.asyn import (
+                async_methods,
+                mirror_sync_methods,
+                private,
+            )
+
+            for method in set(async_methods + dir(AsyncFileSystem)):
+                if not method.startswith("_") or not private.match(method):
+                    continue
+                view.__dict__.pop(method[1:], None)
+            mirror_sync_methods(view)
+        view._as_of = _coerce_as_of_timestamp(timestamp)
+        # the view gets its own listings cache, so that snapshot listings
+        # never mix with (or invalidate) the live filesystem's cache
+        view.dircache = DirCache(
+            use_listings_cache=self.dircache.use_listings_cache,
+            listings_expiry_time=self.dircache.listings_expiry_time,
+            max_paths=self.dircache.max_paths,
+        )
+        return view
+
+    def _check_writable(self):
+        if self._as_of is not None:
+            raise OSError(
+                errno.EROFS,
+                "as_of views are read-only; writes, deletes and metadata "
+                "changes must be performed on the live filesystem",
+            )
 
     _metadata_cache = {}
 
@@ -2035,6 +2316,7 @@ class S3FileSystem(AsyncFileSystem):
         .. _Metadata Reference: http://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html#object-metadata
         """
 
+        self._check_writable()
         kw_args = {k.replace("_", "-"): v for k, v in kw_args.items()}
         bucket, key, version_id = self.split_path(path)
         metadata = await self._metadata(path)
@@ -2079,6 +2361,7 @@ class S3FileSystem(AsyncFileSystem):
         recursive : bool
             whether to apply the ACL to all keys below the given path too
         """
+        self._check_writable()
         bucket, key, version_id = self.split_path(path)
         if recursive:
             allfiles = await self._find(path, withdirs=False)
@@ -2137,6 +2420,7 @@ class S3FileSystem(AsyncFileSystem):
         filelist : list of str
             The paths, in order, to assemble into the final file.
         """
+        self._check_writable()
         bucket, key, version_id = self.split_path(path)
         if version_id:
             raise ValueError("Cannot write to an explicit versioned file!")
@@ -2293,6 +2577,7 @@ class S3FileSystem(AsyncFileSystem):
             reproduce the same multipart upload while copying and preserve
             the generated etag.
         """
+        self._check_writable()
         path1 = self._strip_protocol(path1)
         bucket, key, vers = self.split_path(path1)
 
@@ -2333,6 +2618,7 @@ class S3FileSystem(AsyncFileSystem):
 
     async def _clear_multipart_uploads(self, bucket):
         """Remove any partial uploads in the bucket"""
+        self._check_writable()
         await asyncio.gather(
             *[
                 self._abort_mpu(bucket, upload["Key"], upload["UploadId"])
@@ -2352,6 +2638,7 @@ class S3FileSystem(AsyncFileSystem):
             The keys to remove, must all be in the same bucket.
             Must have 0 < len <= 1000
         """
+        self._check_writable()
         if not pathlist:
             return []
         buckets = {self.split_path(path)[0] for path in pathlist}
@@ -2379,6 +2666,7 @@ class S3FileSystem(AsyncFileSystem):
         return [f"{bucket}/{_['Key']}" for _ in out.get("Deleted", [])]
 
     async def _rm_file(self, path, **kwargs):
+        self._check_writable()
         bucket, key, _ = self.split_path(path)
         self.invalidate_cache(path)
 
@@ -2388,6 +2676,7 @@ class S3FileSystem(AsyncFileSystem):
             raise translate_boto_error(e)
 
     async def _rm(self, path, recursive=False, **kwargs):
+        self._check_writable()
         if recursive and isinstance(path, str):
             bucket, key, _ = self.split_path(path)
             if not key and await self._is_bucket_versioned(bucket):
