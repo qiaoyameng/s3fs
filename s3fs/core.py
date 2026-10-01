@@ -1481,7 +1481,15 @@ class S3FileSystem(AsyncFileSystem):
         """
         mode=="create", exclusive write, is only known to work on AWS S3, and
         requires botocore>1.35.20
+
+        checkpoint_path : str, optional
+            If given, the multipart upload is driven by an on-disk checkpoint
+            so that an interrupted upload can be resumed after a restart via
+            :meth:`resume_put_file` or by re-issuing this call with the same
+            ``checkpoint_path``.
         """
+        from s3fs.checkpoint import put_file_with_checkpoint
+
         bucket, key, _ = self.split_path(rpath)
         if os.path.isdir(lpath):
             if key:
@@ -1489,6 +1497,24 @@ class S3FileSystem(AsyncFileSystem):
                 return
             else:
                 await self._mkdir(lpath)
+        checkpoint_path = kwargs.pop("checkpoint_path", None)
+        if checkpoint_path:
+            if "ContentType" not in kwargs:
+                content_type, _ = mimetypes.guess_type(lpath)
+                if content_type is not None:
+                    kwargs["ContentType"] = content_type
+            await put_file_with_checkpoint(
+                self,
+                lpath,
+                rpath,
+                checkpoint_path,
+                callback=callback,
+                chunksize=chunksize,
+                max_concurrency=max_concurrency,
+                mode=mode,
+                **kwargs,
+            )
+            return
         size = os.path.getsize(lpath)
         callback.set_size(size)
         if mode == "create":
@@ -2320,6 +2346,74 @@ class S3FileSystem(AsyncFileSystem):
         return out.get("Contents", []) or out.get("Uploads", [])
 
     list_multipart_uploads = sync_wrapper(_list_multipart_uploads)
+
+    async def _export_upload_checkpoint(
+        self,
+        lpath,
+        rpath,
+        checkpoint_path,
+        chunksize=None,
+        mode="overwrite",
+        callback=_DEFAULT_CALLBACK,
+        **kwargs,
+    ):
+        """Initiate a multipart upload and export its checkpoint to disk.
+
+        No part data is uploaded. The resulting ``checkpoint_path`` can later
+        be passed to :meth:`resume_put_file` (after a process restart) to
+        continue the very same multipart upload.
+        """
+        from s3fs.checkpoint import create_and_save_checkpoint
+
+        if "ContentType" not in kwargs:
+            content_type, _ = mimetypes.guess_type(lpath)
+            if content_type is not None:
+                kwargs["ContentType"] = content_type
+        return await create_and_save_checkpoint(
+            self,
+            lpath,
+            rpath,
+            checkpoint_path,
+            chunksize=chunksize,
+            mode=mode,
+            callback=callback,
+            **kwargs,
+        )
+
+    export_upload_checkpoint = sync_wrapper(_export_upload_checkpoint)
+
+    async def _resume_put_file(
+        self,
+        checkpoint_path,
+        lpath=None,
+        rpath=None,
+        callback=_DEFAULT_CALLBACK,
+        max_concurrency=None,
+        chunksize=None,
+        mode=None,
+        **kwargs,
+    ):
+        """Resume a multipart upload from an exported checkpoint.
+
+        The source identity and chunking scheme recorded in the checkpoint are
+        revalidated, the server is queried with ``ListParts`` and only parts
+        missing on the server are uploaded before completing the upload.
+        """
+        from s3fs.checkpoint import resume_put_file
+
+        await resume_put_file(
+            self,
+            checkpoint_path,
+            lpath=lpath,
+            rpath=rpath,
+            callback=callback,
+            max_concurrency=max_concurrency,
+            chunksize=chunksize,
+            mode=mode,
+            **kwargs,
+        )
+
+    resume_put_file = sync_wrapper(_resume_put_file)
 
     async def _abort_mpu(self, bucket, key, mpu):
         await self._call_s3(

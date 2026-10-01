@@ -5,6 +5,8 @@ API
 
 .. autosummary::
    S3FileSystem
+   S3FileSystem.export_upload_checkpoint
+   S3FileSystem.resume_put_file
    S3FileSystem.cat
    S3FileSystem.du
    S3FileSystem.exists

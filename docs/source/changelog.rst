@@ -4,6 +4,14 @@ Changelog
 Unreleased
 ----------
 
+- Add resumable multipart uploads driven by an explicit checkpoint:
+  ``export_upload_checkpoint`` initiates the upload and persists the source
+  identity (path/size/SHA256), chunk size, upload id and confirmed parts, and
+  ``resume_put_file`` (or a repeated ``put_file(..., checkpoint_path=...)``)
+  validates the checkpoint, reconciles against ``ListParts``, uploads only
+  missing parts, and queries object status before re-issuing an uncertain
+  completion. Resumption is refused when the source content, chunking
+  parameters or destination changed, or when the upload id is no longer valid.
 - Raise translated errors when S3 reports per-object failures for bulk deletes (#838)
 
 2026.9.0
