@@ -373,6 +373,26 @@ The ``s3.utils.SSEParams`` provides some convenient helpers for the serverside
 encryption parameters in particular.  An instance can be passed instead of a
 regular python dictionary as the ``s3_additional_kwargs`` parameter.
 
+When objects are encrypted with different customer-provided keys (SSE-C), a
+single set of ``s3_additional_kwargs`` is not enough.  In that case, an
+object-level key provider can be given, which resolves the key material for
+each access based on the operation, bucket, key and version
+
+.. code-block:: python
+
+   >>> class MyProvider(s3fs.SSECustomerKeyProvider):
+   ...     def resolve(self, operation, bucket, key, version_id=None):
+   ...         return s3fs.SSECustomerKeyContext(fetch_key_for(bucket, key))
+   >>> s3 = s3fs.S3FileSystem(ssec_key_provider=MyProvider())
+
+``operation`` is one of "read", "write", "copy_source" or "copy_dest"; for
+copies, the source (decryption) and destination (encryption) contexts are
+resolved independently, and within one multipart upload the same resolved
+context is reused for every request.  Resolved key material is never stored
+in caches, ``repr`` output or serialized results.  Note that the provider is
+not part of the instance cache token, so pass ``skip_instance_cache=True``
+when using different providers for otherwise identical instances.
+
 
 Bucket Version Awareness
 ------------------------

@@ -169,6 +169,138 @@ class SSEParams:
         return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
+class SSECustomerKeyContext:
+    """
+    Resolved SSE-C key material for a single object.
+
+    Instances of this class hold plaintext customer key material. The key is
+    never included in ``repr()``/``str()`` output, and instances refuse to be
+    pickled so that credentials cannot leak into serialized results, caches or
+    logs.
+
+    Parameters
+    ----------
+    key : bytes or str
+        The raw (or base64-encoded) SSE-C customer key.
+    algorithm : str
+        The SSE-C algorithm, currently only "AES256" is supported by S3.
+    """
+
+    __slots__ = ("algorithm", "key")
+
+    def __init__(self, key, algorithm="AES256"):
+        if not key:
+            raise ValueError("An SSE-C customer key is required")
+        self.algorithm = algorithm
+        self.key = key
+
+    @property
+    def sse_kwargs(self):
+        """Request kwargs for operations acting on the object itself."""
+        return {
+            "SSECustomerAlgorithm": self.algorithm,
+            "SSECustomerKey": self.key,
+        }
+
+    @property
+    def copy_source_kwargs(self):
+        """Request kwargs for operations reading this object as a copy source."""
+        return {
+            "CopySourceSSECustomerAlgorithm": self.algorithm,
+            "CopySourceSSECustomerKey": self.key,
+        }
+
+    def __repr__(self):
+        return "%s(algorithm=%r, key=<redacted>)" % (
+            type(self).__name__,
+            self.algorithm,
+        )
+
+    __str__ = __repr__
+
+    def __reduce__(self):
+        raise TypeError(
+            "SSECustomerKeyContext holds key material and cannot be serialized"
+        )
+
+
+class SSECustomerKeyProvider:
+    """
+    Base class for object-level SSE-C key providers.
+
+    A provider lets a single :class:`~s3fs.S3FileSystem` instance work with
+    objects encrypted with different SSE-C customer keys (e.g. one key per
+    customer) by resolving the key material needed for each individual
+    operation, instead of fixing one key in ``s3_additional_kwargs``.
+
+    Subclasses must implement :meth:`resolve`. A plain callable with the same
+    signature as :meth:`resolve` may also be used anywhere a provider is
+    accepted.
+    """
+
+    def resolve(self, operation, bucket, key, version_id=None):
+        """
+        Return the key material for one object access.
+
+        Parameters
+        ----------
+        operation : str
+            One of ``"read"``, ``"write"``, ``"copy_source"`` or
+            ``"copy_dest"``. For copies, the source (decryption) and the
+            destination (encryption) contexts are resolved independently.
+        bucket, key : str
+            The object being accessed.
+        version_id : str or None
+            The object version, when the filesystem is version-aware.
+
+        Returns
+        -------
+        SSECustomerKeyContext, dict or None
+            A context (or a ready-made dict of request kwargs) to use for this
+            access, or None to send no SSE-C parameters.
+        """
+        raise NotImplementedError
+
+
+def resolve_ssec_provider(provider, operation, bucket, key, version_id=None):
+    """
+    Call ``provider`` and normalize the result.
+
+    Returns an :class:`SSECustomerKeyContext`, a dict of request kwargs, or
+    None. Raises TypeError for unsupported providers or return values.
+    """
+    resolve = getattr(provider, "resolve", None)
+    if resolve is None:
+        if callable(provider):
+            resolve = provider
+        else:
+            raise TypeError(
+                "ssec_key_provider must be callable or implement "
+                "resolve(operation, bucket, key, version_id)"
+            )
+    context = resolve(operation, bucket, key, version_id)
+    if context is None or isinstance(context, (SSECustomerKeyContext, dict)):
+        return context
+    raise TypeError(
+        "ssec_key_provider must return an SSECustomerKeyContext, a dict of "
+        "request kwargs or None, not %r" % type(context).__name__
+    )
+
+
+def ssec_context_kwargs(context, copy_source=False):
+    """
+    Derive request kwargs from a resolved SSE-C context.
+
+    Dict contexts are returned unchanged (a copy); it is then the provider's
+    responsibility to return operation-appropriate parameters.
+    """
+    if context is None:
+        return {}
+    if isinstance(context, SSECustomerKeyContext):
+        return context.copy_source_kwargs if copy_source else context.sse_kwargs
+    return dict(context)
+
+
 def _get_brange(size, block):
     """
     Chunk up a file into zero-based byte ranges

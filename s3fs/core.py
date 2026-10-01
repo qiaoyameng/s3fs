@@ -33,7 +33,14 @@ from botocore.exceptions import ClientError, HTTPClientError, ParamValidationErr
 from botocore.parsers import ResponseParserError
 
 from s3fs.errors import translate_boto_error
-from s3fs.utils import S3BucketRegionCache, ParamKwargsHelper, _get_brange, FileExpired
+from s3fs.utils import (
+    S3BucketRegionCache,
+    ParamKwargsHelper,
+    _get_brange,
+    FileExpired,
+    resolve_ssec_provider,
+    ssec_context_kwargs,
+)
 
 # ClientPayloadError can be thrown during an incomplete read. aiohttp is a dependency of
 # aiobotocore, we guard the import here in case this dependency is replaced in a future version
@@ -70,6 +77,23 @@ S3_RETRYABLE_ERRORS = (
 )
 
 MAX_UPLOAD_PARTS = 10_000  # maximum number of parts for S3 multipart upload
+
+# Request parameters that carry SSE-C key material; never written to logs.
+_SSEC_SENSITIVE_KWARGS = frozenset(
+    {
+        "SSECustomerKey",
+        "SSECustomerKeyMD5",
+        "CopySourceSSECustomerKey",
+        "CopySourceSSECustomerKeyMD5",
+    }
+)
+
+
+def _redact_sensitive_kwargs(kwargs):
+    return {
+        k: ("<redacted>" if k in _SSEC_SENSITIVE_KWARGS else v)
+        for k, v in kwargs.items()
+    }
 
 if ClientPayloadError is not None:
     S3_RETRYABLE_ERRORS += (ClientPayloadError,)
@@ -340,6 +364,20 @@ class S3FileSystem(AsyncFileSystem):
         Perform expiry checks when using range reads locally instead of having the
         server perform them. VAST S3 requires local_expiry_check=True because
         it doesn't support the `If-Match` http header used for expiry check on the server.
+    ssec_key_provider : SSECustomerKeyProvider or callable (None)
+        Object-level SSE-C key provider, for accessing objects that are
+        encrypted with different customer keys (SSE-C) through a single
+        filesystem instance. It is called as
+        ``resolve(operation, bucket, key, version_id)`` before each object
+        access, where ``operation`` is one of "read", "write", "copy_source"
+        or "copy_dest", and must return an ``SSECustomerKeyContext``, a dict
+        of request kwargs, or None. For copies, the source (decryption) and
+        destination (encryption) contexts are resolved independently. Within
+        one multipart upload, the same resolved context is reused for every
+        request. Resolved key material is never stored in caches, ``repr``
+        output or serialized results; note that the provider is not part of
+        the instance cache token, so pass ``skip_instance_cache=True`` when
+        using different providers for otherwise identical instances.
 
     The following parameters are passed on to fsspec:
 
@@ -364,6 +402,9 @@ class S3FileSystem(AsyncFileSystem):
     default_block_size = 50 * 2**20
     protocol = ("s3", "s3a")
     _extra_tokenize_attributes = ("default_block_size",)
+    # The key provider holds credentials: keep it out of the instance-cache
+    # token, storage_options and therefore pickle/serialization results.
+    _strip_tokenize_options = ("ssec_key_provider",)
 
     def __init__(
         self,
@@ -390,6 +431,7 @@ class S3FileSystem(AsyncFileSystem):
         max_concurrency=10,
         fixed_upload_size: bool = False,
         local_expiry_check: bool = False,
+        ssec_key_provider=None,
         **kwargs,
     ):
         if key and username:
@@ -437,6 +479,15 @@ class S3FileSystem(AsyncFileSystem):
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
         self.max_concurrency = max_concurrency
+        if ssec_key_provider is not None and not (
+            callable(ssec_key_provider)
+            or callable(getattr(ssec_key_provider, "resolve", None))
+        ):
+            raise TypeError(
+                "ssec_key_provider must be callable or implement "
+                "resolve(operation, bucket, key, version_id)"
+            )
+        self.ssec_key_provider = ssec_key_provider
 
     @property
     def s3(self):
@@ -461,13 +512,36 @@ class S3FileSystem(AsyncFileSystem):
         method = getattr(s3, method)
         kw2 = kwargs.copy()
         kw2.pop("Body", None)
-        logger.debug("CALL: %s - %s - %s", method.__name__, akwarglist, kw2)
+        logger.debug(
+            "CALL: %s - %s - %s",
+            method.__name__,
+            [_redact_sensitive_kwargs(akw) for akw in akwarglist],
+            _redact_sensitive_kwargs(kw2),
+        )
         additional_kwargs = self._get_s3_method_kwargs(method, *akwarglist, **kwargs)
         return await _error_wrapper(
             method, kwargs=additional_kwargs, retries=self.retries
         )
 
     call_s3 = sync_wrapper(_call_s3)
+
+    def _resolve_ssec_context(self, operation, bucket, key, version_id=None):
+        """
+        Resolve the pinned SSE-C context for one logical operation.
+
+        Returns an ``SSECustomerKeyContext``, a dict of request kwargs, or
+        None when no provider is configured or the provider declines.
+        """
+        if self.ssec_key_provider is None:
+            return None
+        return resolve_ssec_provider(
+            self.ssec_key_provider, operation, bucket, key, version_id
+        )
+
+    def _resolve_ssec_kwargs(self, operation, bucket, key, version_id=None):
+        """Request kwargs contributed by the SSE-C key provider, if any."""
+        context = self._resolve_ssec_context(operation, bucket, key, version_id)
+        return ssec_context_kwargs(context, copy_source=(operation == "copy_source"))
 
     def _get_s3_method_kwargs(self, method, *akwarglist, **kwargs):
         additional_kwargs = self.s3_additional_kwargs.copy()
@@ -1302,7 +1376,11 @@ class S3FileSystem(AsyncFileSystem):
             raise ValueError("S3 does not support touching existent files")
         try:
             write_result = await self._call_s3(
-                "put_object", Bucket=bucket, Key=key, **kwargs
+                "put_object",
+                Bucket=bucket,
+                Key=key,
+                **kwargs,
+                **self._resolve_ssec_kwargs("write", bucket, key),
             )
         except ClientError as ex:
             raise translate_boto_error(ex)
@@ -1325,6 +1403,7 @@ class S3FileSystem(AsyncFileSystem):
             head = {"Range": await self._process_limits(path, start, end)}
         else:
             head = {}
+        ssec_kw = self._resolve_ssec_kwargs("read", bucket, key, version_id or vers)
 
         async def _call_and_read():
             resp = await self._call_s3(
@@ -1332,6 +1411,7 @@ class S3FileSystem(AsyncFileSystem):
                 Bucket=bucket,
                 Key=key,
                 **version_id_kw(version_id or vers),
+                **ssec_kw,
                 **head,
             )
             try:
@@ -1355,6 +1435,7 @@ class S3FileSystem(AsyncFileSystem):
                     chunksize,
                     max_concurrency=max_concurrency,
                     version_id=version_id or vers,
+                    ssec_kwargs=ssec_kw,
                 )
 
         return await _error_wrapper(_call_and_read, retries=self.retries)
@@ -1367,11 +1448,13 @@ class S3FileSystem(AsyncFileSystem):
         chunksize,
         max_concurrency=None,
         version_id=None,
+        ssec_kwargs=None,
     ):
         max_concurrency = max_concurrency or self.max_concurrency
 
         async def _read_chunk(start, end):
             kw = self.req_kw.copy()
+            kw.update(ssec_kwargs or {})
             kw["Range"] = f"bytes={start}-{end}"
             resp = await self._call_s3(
                 "get_object",
@@ -1420,6 +1503,10 @@ class S3FileSystem(AsyncFileSystem):
             match = {"IfNoneMatch": "*"}
         else:
             match = {}
+        # Resolve the SSE-C context once so the whole (possibly multipart)
+        # upload uses identical key material.
+        ssec_kw = self._resolve_ssec_kwargs("write", bucket, key)
+        kwargs = {**kwargs, **ssec_kw}
 
         # 5 GB is the limit for an S3 PUT
         if size < min(5 * 2**30, 2 * chunksize):
@@ -1447,6 +1534,7 @@ class S3FileSystem(AsyncFileSystem):
                                 UploadId=mpu["UploadId"],
                                 Body=data[ranges[i] : ranges[i] + chunksize],
                                 Key=key,
+                                **ssec_kw,
                             )
                             for i in range(start, stop)
                         ]
@@ -1501,6 +1589,11 @@ class S3FileSystem(AsyncFileSystem):
             if content_type is not None:
                 kwargs["ContentType"] = content_type
 
+        # Resolve the SSE-C context once so the whole (possibly multipart)
+        # upload uses identical key material.
+        ssec_kw = self._resolve_ssec_kwargs("write", bucket, key)
+        kwargs = {**kwargs, **ssec_kw}
+
         chunksize = calculate_chunksize(size, chunksize=chunksize)
         with open(lpath, "rb") as f0:
             if size < min(5 * 2**30, 2 * chunksize):
@@ -1523,6 +1616,7 @@ class S3FileSystem(AsyncFileSystem):
                         chunksize,
                         callback=callback,
                         max_concurrency=max_concurrency,
+                        ssec_kwargs=ssec_kw,
                     )
                     parts = [
                         {"PartNumber": i + 1, "ETag": o["ETag"]}
@@ -1552,6 +1646,7 @@ class S3FileSystem(AsyncFileSystem):
         chunksize,
         callback=_DEFAULT_CALLBACK,
         max_concurrency=None,
+        ssec_kwargs=None,
     ):
         max_concurrency = max_concurrency or self.max_concurrency
         if max_concurrency < 1:
@@ -1565,6 +1660,7 @@ class S3FileSystem(AsyncFileSystem):
                 UploadId=mpu["UploadId"],
                 Body=chunk,
                 Key=key,
+                **(ssec_kwargs or {}),
             )
             callback.relative_update(len(chunk))
             return result
@@ -1598,11 +1694,13 @@ class S3FileSystem(AsyncFileSystem):
         callback=_DEFAULT_CALLBACK,
         max_concurrency=None,
         version_id=None,
+        ssec_kwargs=None,
     ):
         max_concurrency = max_concurrency or self.max_concurrency
 
         async def _download_chunk(start, end):
             kw = self.req_kw.copy()
+            kw.update(ssec_kwargs or {})
             kw["Range"] = f"bytes={start}-{end}"
             resp = await self._call_s3(
                 "get_object",
@@ -1646,9 +1744,11 @@ class S3FileSystem(AsyncFileSystem):
         if os.path.isdir(lpath):
             return
         bucket, key, vers = self.split_path(rpath)
+        ssec_kw = self._resolve_ssec_kwargs("read", bucket, key, version_id or vers)
 
         async def _open_file(range: int):
             kw = self.req_kw.copy()
+            kw.update(ssec_kw)
             if range:
                 kw["Range"] = f"bytes={range}-"
             resp = await self._call_s3(
@@ -1680,6 +1780,7 @@ class S3FileSystem(AsyncFileSystem):
                 callback=callback,
                 max_concurrency=max_concurrency,
                 version_id=version_id or vers,
+                ssec_kwargs=ssec_kw,
             )
 
         # Sequential download for small files or concurrency=1
@@ -1763,6 +1864,7 @@ class S3FileSystem(AsyncFileSystem):
                     self.kwargs,
                     Bucket=bucket,
                     Key=key,
+                    **self._resolve_ssec_kwargs("read", bucket, key, version_id),
                     **version_id_kw(version_id),
                 )
                 return {
@@ -2140,23 +2242,31 @@ class S3FileSystem(AsyncFileSystem):
         bucket, key, version_id = self.split_path(path)
         if version_id:
             raise ValueError("Cannot write to an explicit versioned file!")
+        dst_kw = self._resolve_ssec_kwargs("copy_dest", bucket, key)
         mpu = await self._call_s3(
-            "create_multipart_upload", kwargs, Bucket=bucket, Key=key
+            "create_multipart_upload", kwargs, dst_kw, Bucket=bucket, Key=key
         )
         # TODO: Make this support versions?
+
+        async def _copy_part(part_number, source):
+            src_bucket, src_key, src_version = self.split_path(source)
+            src_kw = self._resolve_ssec_kwargs(
+                "copy_source", src_bucket, src_key, src_version
+            )
+            return await self._call_s3(
+                "upload_part_copy",
+                kwargs,
+                dst_kw,
+                src_kw,
+                Bucket=bucket,
+                Key=key,
+                UploadId=mpu["UploadId"],
+                CopySource=source,
+                PartNumber=part_number,
+            )
+
         out = await asyncio.gather(
-            *[
-                self._call_s3(
-                    "upload_part_copy",
-                    kwargs,
-                    Bucket=bucket,
-                    Key=key,
-                    UploadId=mpu["UploadId"],
-                    CopySource=f,
-                    PartNumber=i + 1,
-                )
-                for (i, f) in enumerate(filelist)
-            ]
+            *[_copy_part(i + 1, f) for (i, f) in enumerate(filelist)]
         )
         parts = [
             {"PartNumber": i + 1, "ETag": o["CopyPartResult"]["ETag"]}
@@ -2183,12 +2293,21 @@ class S3FileSystem(AsyncFileSystem):
         buc2, key2, ver2 = self.split_path(path2)
         if ver2:
             raise ValueError("Cannot copy to a versioned file!")
+        # Source decryption and destination encryption are independent contexts
+        src_ctx = self._resolve_ssec_context("copy_source", buc1, key1, ver1)
+        dst_ctx = self._resolve_ssec_context("copy_dest", buc2, key2)
         try:
             copy_src = {"Bucket": buc1, "Key": key1}
             if ver1:
                 copy_src["VersionId"] = ver1
             await self._call_s3(
-                "copy_object", kwargs, Bucket=buc2, Key=key2, CopySource=copy_src
+                "copy_object",
+                kwargs,
+                ssec_context_kwargs(dst_ctx),
+                ssec_context_kwargs(src_ctx, copy_source=True),
+                Bucket=buc2,
+                Key=key2,
+                CopySource=copy_src,
             )
         except ClientError as e:
             raise translate_boto_error(e)
@@ -2203,12 +2322,26 @@ class S3FileSystem(AsyncFileSystem):
         bucket1, key1, version1 = self.split_path(path1)
         bucket2, key2, version2 = self.split_path(path2)
 
+        # Source decryption and destination encryption are independent contexts,
+        # each pinned for the whole multipart operation.
+        src_ctx = self._resolve_ssec_context("copy_source", bucket1, key1, version1)
+        dst_ctx = self._resolve_ssec_context("copy_dest", bucket2, key2)
+        src_read_kw = ssec_context_kwargs(src_ctx)
+        src_copy_kw = ssec_context_kwargs(src_ctx, copy_source=True)
+        dst_kw = ssec_context_kwargs(dst_ctx)
+
         mpu = await self._call_s3(
-            "create_multipart_upload", Bucket=bucket2, Key=key2, **kwargs
+            "create_multipart_upload", Bucket=bucket2, Key=key2, **kwargs, **dst_kw
         )
         part_infos = await asyncio.gather(
             *[
-                self._call_s3("head_object", Bucket=bucket1, Key=key1, PartNumber=i)
+                self._call_s3(
+                    "head_object",
+                    Bucket=bucket1,
+                    Key=key1,
+                    PartNumber=i,
+                    **src_read_kw,
+                )
                 for i in range(1, total_parts + 1)
             ]
         )
@@ -2229,6 +2362,8 @@ class S3FileSystem(AsyncFileSystem):
                 UploadId=mpu["UploadId"],
                 CopySource=path1,
                 CopySourceRange="bytes=%i-%i" % (brange_first, brange_last),
+                **dst_kw,
+                **src_copy_kw,
             )
             parts.append({"PartNumber": i, "ETag": part["CopyPartResult"]["ETag"]})
             brange_first += part_size
@@ -2252,8 +2387,15 @@ class S3FileSystem(AsyncFileSystem):
         if block < 5 * 2**20 or block > 5 * 2**30:
             raise ValueError("Copy block size must be 5MB<=block<=5GB")
         bucket, key, version = self.split_path(path2)
+        bucket1, key1, version1 = self.split_path(path1)
+        # Source decryption and destination encryption are independent contexts,
+        # each pinned for the whole multipart operation.
+        src_ctx = self._resolve_ssec_context("copy_source", bucket1, key1, version1)
+        dst_ctx = self._resolve_ssec_context("copy_dest", bucket, key)
+        src_copy_kw = ssec_context_kwargs(src_ctx, copy_source=True)
+        dst_kw = ssec_context_kwargs(dst_ctx)
         mpu = await self._call_s3(
-            "create_multipart_upload", Bucket=bucket, Key=key, **kwargs
+            "create_multipart_upload", Bucket=bucket, Key=key, **kwargs, **dst_kw
         )
         # attempting to do the following calls concurrently with gather causes
         # occasional "upload is smaller than the minimum allowed"
@@ -2266,6 +2408,8 @@ class S3FileSystem(AsyncFileSystem):
                 UploadId=mpu["UploadId"],
                 CopySource=self._strip_protocol(path1),
                 CopySourceRange="bytes=%i-%i" % (brange_first, brange_last),
+                **dst_kw,
+                **src_copy_kw,
             )
             for i, (brange_first, brange_last) in enumerate(_get_brange(size, block))
         ]
@@ -2566,6 +2710,9 @@ class S3File(AbstractBufferedFile):
         self.parts = None
         self.fill_cache = fill_cache
         self.s3_additional_kwargs = s3_additional_kwargs or {}
+        # SSE-C request kwargs for the current upload, resolved lazily and
+        # pinned so one (multipart) upload always uses identical key material.
+        self._ssec_write_kwargs = None
         self.req_kw = {"RequestPayer": "requester"} if requester_pays else {}
         self._request_payer_kw = {"RequestPayer": self.req_kw.get("RequestPayer")}
         self.read_kw = self._request_payer_kw
@@ -2651,6 +2798,13 @@ class S3File(AbstractBufferedFile):
             **kwargs,
         )
 
+    def _get_ssec_write_kwargs(self):
+        if self._ssec_write_kwargs is None:
+            self._ssec_write_kwargs = self.fs._resolve_ssec_kwargs(
+                "write", self.bucket, self.key
+            )
+        return self._ssec_write_kwargs
+
     def _initiate_upload(self):
         if self.autocommit and not self.append_block and self.tell() < self.blocksize:
             # only happens when closing small file, use on-shot PUT
@@ -2660,6 +2814,7 @@ class S3File(AbstractBufferedFile):
         kw = dict(
             Bucket=self.bucket,
             Key=self.key,
+            **self._get_ssec_write_kwargs(),
         )
         if self.acl:
             kw["ACL"] = self.acl
@@ -2671,6 +2826,10 @@ class S3File(AbstractBufferedFile):
             out = self._call_s3(
                 "upload_part_copy",
                 self.s3_additional_kwargs,
+                self._get_ssec_write_kwargs(),
+                self.fs._resolve_ssec_kwargs(
+                    "copy_source", self.bucket, self.key, self.version_id
+                ),
                 Bucket=self.bucket,
                 Key=self.key,
                 PartNumber=1,
@@ -2769,6 +2928,7 @@ class S3File(AbstractBufferedFile):
                     UploadId=self.mpu["UploadId"],
                     Body=part_data,
                     Key=key,
+                    **self._get_ssec_write_kwargs(),
                 )
 
                 part_header = {"PartNumber": part, "ETag": out["ETag"]}
@@ -2813,7 +2973,13 @@ class S3File(AbstractBufferedFile):
                 logger.debug("One-shot upload of %s" % self)
                 self.buffer.seek(0)
                 data = self.buffer.read()
-                kw = dict(Key=self.key, Bucket=self.bucket, Body=data, **self.kwargs)
+                kw = dict(
+                    Key=self.key,
+                    Bucket=self.bucket,
+                    Body=data,
+                    **self.kwargs,
+                    **self._get_ssec_write_kwargs(),
+                )
                 if self.acl:
                     kw["ACL"] = self.acl
                 write_result = self._call_s3("put_object", **kw, **match)
@@ -2867,7 +3033,12 @@ class S3AsyncStreamedFile(AbstractAsyncStreamedFile):
     async def read(self, length=-1):
         if self.r is None:
             bucket, key, gen = self.fs.split_path(self.path)
-            r = await self.fs._call_s3("get_object", Bucket=bucket, Key=key)
+            r = await self.fs._call_s3(
+                "get_object",
+                Bucket=bucket,
+                Key=key,
+                **self.fs._resolve_ssec_kwargs("read", bucket, key, gen),
+            )
             self.size = int(r["ResponseMetadata"]["HTTPHeaders"]["content-length"])
             self.r = r["Body"]
         out = await self.r.read(length)
@@ -2908,6 +3079,7 @@ async def _inner_fetch(
             Key=key,
             Range="bytes=%i-%i" % (start, end - 1),
             **version_id_kw(version_id),
+            **fs._resolve_ssec_kwargs("read", bucket, key, version_id),
             **req_kw,
         )
         if (
