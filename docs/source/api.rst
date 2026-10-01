@@ -4,7 +4,11 @@ API
 .. currentmodule:: s3fs.core
 
 .. autosummary::
+   DeleteReport
+   DeleteResult
+   DeleteStatus
    S3FileSystem
+   S3FileSystem.bulk_delete
    S3FileSystem.cat
    S3FileSystem.du
    S3FileSystem.exists

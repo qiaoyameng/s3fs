@@ -20,7 +20,12 @@ from dateutil.tz import tzutc
 
 import botocore
 import s3fs.core
-from s3fs.core import MAX_UPLOAD_PARTS, S3FileSystem, calculate_chunksize
+from s3fs.core import (
+    MAX_UPLOAD_PARTS,
+    DeleteReport,
+    S3FileSystem,
+    calculate_chunksize,
+)
 from s3fs.utils import ignoring, SSEParams, FileExpired
 from botocore.exceptions import NoCredentialsError
 from fsspec.asyn import sync
@@ -844,6 +849,87 @@ def test_rm_delete_error_after_successful_batch(s3, monkeypatch):
         s3.rm(paths)
     assert sorted(len(objects) for objects in calls) == [1, 1000]
     assert parent not in s3.dircache
+
+
+def test_bulk_delete_report_records_delete_markers(s3):
+    fs = S3FileSystem(
+        anon=False,
+        version_aware=True,
+        client_kwargs={"endpoint_url": endpoint_uri},
+    )
+    key = f"{versioned_bucket_name}/marker-object"
+    client = get_boto3_client()
+    client.put_object(Bucket=versioned_bucket_name, Key="marker-object", Body=b"1")
+    first_version = client.list_object_versions(Bucket=versioned_bucket_name)[
+        "Versions"
+    ][0]["VersionId"]
+    client.delete_object(Bucket=versioned_bucket_name, Key="marker-object")
+    marker = client.list_object_versions(Bucket=versioned_bucket_name)[
+        "DeleteMarkers"
+    ][0]
+
+    report = fs.bulk_delete(
+        [
+            f"{key}?versionId={first_version}",
+            f"{key}?versionId={marker['VersionId']}",
+        ]
+    )
+
+    assert len(report.succeeded) == 1
+    assert report.succeeded[0].version_id == first_version
+    assert len(report.delete_markers) == 1
+    assert report.delete_markers[0].version_id == marker["VersionId"]
+    assert report.delete_markers[0].delete_marker is True
+
+
+def test_rm_report_keeps_results_when_version_listing_interrupts(s3, monkeypatch):
+    fs = S3FileSystem(
+        anon=False,
+        version_aware=True,
+        client_kwargs={"endpoint_url": endpoint_uri},
+    )
+    pages = [
+        {
+            "Versions": [
+                {"Key": "confirmed", "VersionId": "v1"},
+            ],
+            "DeleteMarkers": [],
+            "IsTruncated": True,
+            "NextKeyMarker": "next",
+            "NextVersionIdMarker": "next-version",
+        }
+    ]
+    deleted_objects = []
+
+    async def list_object_versions(*args, **kwargs):
+        if pages:
+            return pages.pop(0)
+        raise socket.timeout()
+
+    async def delete_objects(*args, **kwargs):
+        deleted_objects.extend(kwargs["Delete"]["Objects"])
+        return {
+            "Deleted": [
+                {
+                    "Key": obj["Key"],
+                    "VersionId": obj["VersionId"],
+                }
+                for obj in kwargs["Delete"]["Objects"]
+            ]
+        }
+
+    monkeypatch.setattr(type(fs.s3), "list_object_versions", list_object_versions)
+    monkeypatch.setattr(type(fs.s3), "delete_objects", delete_objects)
+
+    report = fs.rm(versioned_bucket_name, recursive=True, report=DeleteReport())
+
+    assert report.complete is False
+    assert len(report.errors) == 1
+    assert isinstance(report.errors[0], socket.timeout)
+    assert [result.path for result in report.succeeded] == [
+        f"{versioned_bucket_name}/confirmed?versionId=v1"
+    ]
+    assert deleted_objects == [{"Key": "confirmed", "VersionId": "v1"}]
 
 
 @pytest.mark.xfail(reason="anon user is still privileged on moto")

@@ -9,6 +9,7 @@ import os
 import socket
 import weakref
 import re
+from dataclasses import dataclass, field
 
 from urllib3.exceptions import IncompleteRead
 
@@ -242,6 +243,150 @@ def _coalesce_version_id(*args):
         return None
     else:
         return version_ids.pop()
+
+
+MAX_BULK_DELETE_OBJECTS = 1000
+
+
+class DeleteStatus:
+    SUCCESS = "success"
+    PERMANENTLY_REJECTED = "permanently_rejected"
+    RETRYABLE_FAILURE = "retryable_failure"
+    UNKNOWN = "unknown"
+
+
+_DELETE_RETRYABLE_ERROR_CODES = {
+    "BandwidthLimitExceeded",
+    "InternalError",
+    "InternalFailure",
+    "OperationAborted",
+    "RequestRateExceeded",
+    "RequestThrottled",
+    "RequestThrottledException",
+    "RequestTimeout",
+    "RequestTimeoutException",
+    "RetryableError",
+    "ServiceUnavailable",
+    "ServiceUnavailableException",
+    "SlowDown",
+    "Throttling",
+    "ThrottlingException",
+    "TooManyRequestsException",
+}
+
+_DELETE_PERMANENT_ERROR_CODES = {
+    "AccessDenied",
+    "AccessForbidden",
+    "AccountProblem",
+    "AllAccessDisabled",
+    "AuthorizationHeaderMalformed",
+    "CrossLocationLoggingProhibited",
+    "ExpiredToken",
+    "InvalidAccessKeyId",
+    "InvalidPayer",
+    "InvalidSecurity",
+    "InvalidToken",
+    "NotSignedUp",
+    "RequestTimeTooSkewed",
+    "SignatureDoesNotMatch",
+}
+
+
+@dataclass(frozen=True)
+class DeleteResult:
+    bucket: str
+    key: str
+    version_id: str | None = None
+    status: str = DeleteStatus.SUCCESS
+    delete_marker: bool = False
+    delete_marker_version_id: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    error: dict | None = None
+
+    @property
+    def path(self):
+        path = f"{self.bucket}/{self.key}"
+        if self.version_id:
+            path = f"{path}?versionId={self.version_id}"
+        return path
+
+
+@dataclass
+class DeleteReport:
+    succeeded: list[DeleteResult] = field(default_factory=list)
+    permanently_rejected: list[DeleteResult] = field(default_factory=list)
+    retryable_failures: list[DeleteResult] = field(default_factory=list)
+    unknown: list[DeleteResult] = field(default_factory=list)
+    delete_markers: list[DeleteResult] = field(default_factory=list)
+    errors: list[BaseException] = field(default_factory=list)
+    listing_complete: bool = True
+
+    def add(self, result):
+        if result.status == DeleteStatus.SUCCESS:
+            self.succeeded.append(result)
+        elif result.status == DeleteStatus.PERMANENTLY_REJECTED:
+            self.permanently_rejected.append(result)
+        elif result.status == DeleteStatus.RETRYABLE_FAILURE:
+            self.retryable_failures.append(result)
+        else:
+            self.unknown.append(result)
+        if result.delete_marker:
+            self.delete_markers.append(result)
+
+    def discard_identities(self, identities):
+        identities = set(identities)
+        for results in (
+            self.succeeded,
+            self.permanently_rejected,
+            self.retryable_failures,
+            self.unknown,
+        ):
+            results[:] = [
+                result
+                for result in results
+                if (result.bucket, result.key, result.version_id)
+                not in identities
+            ]
+        self.delete_markers[:] = [
+            result
+            for result in self.delete_markers
+            if (result.bucket, result.key, result.version_id) not in identities
+        ]
+
+    @property
+    def failed(self):
+        return [
+            *self.permanently_rejected,
+            *self.retryable_failures,
+            *self.unknown,
+        ]
+
+    @property
+    def retryable_objects(self):
+        return [
+            {"Key": result.key, **version_id_kw(result.version_id)}
+            for result in self.retryable_failures
+            if result.version_id
+        ]
+
+    @property
+    def retryable_paths(self):
+        return [
+            result.path for result in self.retryable_failures if result.version_id
+        ]
+
+    @property
+    def ok(self):
+        return not self.failed
+
+    @property
+    def complete(self):
+        return (
+            self.listing_complete
+            and not self.retryable_failures
+            and not self.unknown
+        )
 
 
 def calculate_chunksize(filesize, chunksize=None, max_parts=MAX_UPLOAD_PARTS) -> int:
@@ -2342,6 +2487,378 @@ class S3FileSystem(AsyncFileSystem):
 
     clear_multipart_uploads = sync_wrapper(_clear_multipart_uploads)
 
+    @staticmethod
+    def _delete_error_status(code, status_code, version_id):
+        if code in _DELETE_RETRYABLE_ERROR_CODES or (
+            status_code is not None and 500 <= status_code <= 599
+        ):
+            return (
+                DeleteStatus.RETRYABLE_FAILURE
+                if version_id
+                else DeleteStatus.UNKNOWN
+            )
+        if code in _DELETE_PERMANENT_ERROR_CODES or status_code in {
+            400,
+            403,
+            404,
+            405,
+            409,
+            410,
+        }:
+            return DeleteStatus.PERMANENTLY_REJECTED
+        return DeleteStatus.UNKNOWN
+
+    @staticmethod
+    def _client_error_details(error):
+        response = getattr(error, "response", {}) or {}
+        error_info = response.get("Error", {}) or {}
+        metadata = response.get("ResponseMetadata", {}) or {}
+        return (
+            error_info.get("Code"),
+            metadata.get("HTTPStatusCode"),
+            error_info.get("Message", str(error)),
+        )
+
+    @staticmethod
+    def _delete_object_identity(bucket, obj):
+        return bucket, obj["Key"], obj.get("VersionId")
+
+    def _record_delete_response(self, report, bucket, requested, response):
+        by_identity = {
+            self._delete_object_identity(bucket, obj): obj for obj in requested
+        }
+        confirmed = set()
+
+        for deleted in response.get("Deleted", []) or []:
+            identity = (bucket, deleted["Key"], deleted.get("VersionId"))
+            obj = by_identity.get(identity)
+            if obj is None and (
+                deleted.get("DeleteMarker") or not deleted.get("VersionId")
+            ):
+                matches = [
+                    candidate
+                    for candidate in requested
+                    if candidate["Key"] == deleted["Key"]
+                    and not candidate.get("VersionId")
+                ]
+                if len(matches) == 1:
+                    obj = matches[0]
+                    identity = self._delete_object_identity(bucket, obj)
+            if obj is None:
+                continue
+            confirmed.add(identity)
+            report.add(
+                DeleteResult(
+                    bucket,
+                    obj["Key"],
+                    obj.get("VersionId"),
+                    DeleteStatus.SUCCESS,
+                    bool(deleted.get("DeleteMarker")),
+                    deleted.get("DeleteMarkerVersionId"),
+                )
+            )
+
+        for error in response.get("Errors", []) or []:
+            identity = (bucket, error["Key"], error.get("VersionId"))
+            obj = by_identity.get(identity)
+            if obj is None and not error.get("VersionId"):
+                matches = [
+                    candidate
+                    for candidate in requested
+                    if candidate["Key"] == error["Key"]
+                    and not candidate.get("VersionId")
+                ]
+                if len(matches) == 1:
+                    obj = matches[0]
+                    identity = self._delete_object_identity(bucket, obj)
+            if obj is None:
+                continue
+            code = error.get("Code")
+            status_code = (
+                response.get("ResponseMetadata", {}) or {}
+            ).get("HTTPStatusCode")
+            confirmed.add(identity)
+            report.add(
+                DeleteResult(
+                    bucket,
+                    obj["Key"],
+                    obj.get("VersionId"),
+                    self._delete_error_status(
+                        code, status_code, obj.get("VersionId")
+                    ),
+                    error_code=code,
+                    error_message=error.get("Message"),
+                    error=error,
+                )
+            )
+
+        for obj in requested:
+            if self._delete_object_identity(bucket, obj) not in confirmed:
+                report.add(
+                    DeleteResult(
+                        bucket,
+                        obj["Key"],
+                        obj.get("VersionId"),
+                        DeleteStatus.UNKNOWN,
+                    )
+                )
+
+    async def _delete_objects_batch_once(self, bucket, objects, **kwargs):
+        await self.set_session()
+        s3 = await self.get_s3(bucket)
+        method = s3.delete_objects
+        request_kwargs = self._get_s3_method_kwargs(
+            method,
+            kwargs,
+            Bucket=bucket,
+            Delete={"Objects": objects, "Quiet": False},
+        )
+        return await _error_wrapper(method, kwargs=request_kwargs, retries=1)
+
+    async def _delete_objects_with_report(
+        self, bucket, objects, report, retries=None, **kwargs
+    ):
+        if not objects:
+            return
+        retries = max(1, self.retries if retries is None else retries)
+        current = []
+        seen = set()
+        for obj in objects:
+            identity = self._delete_object_identity(bucket, obj)
+            if identity not in seen:
+                seen.add(identity)
+                current.append(
+                    {"Key": obj["Key"], **version_id_kw(obj.get("VersionId"))}
+                )
+
+        for attempt in range(retries):
+            try:
+                response = await self._delete_objects_batch_once(
+                    bucket, current, **kwargs
+                )
+                self._record_delete_response(report, bucket, current, response)
+                current_identities = {
+                    self._delete_object_identity(bucket, obj) for obj in current
+                }
+                retryable = [
+                    {
+                        "Key": result.key,
+                        **version_id_kw(result.version_id),
+                    }
+                    for result in report.retryable_failures
+                    if (
+                        result.bucket,
+                        result.key,
+                        result.version_id,
+                    )
+                    in current_identities
+                    if result.version_id
+                ]
+                if not retryable:
+                    return
+                retryable_identities = {
+                    (bucket, obj["Key"], obj.get("VersionId"))
+                    for obj in retryable
+                }
+                if attempt + 1 < retries:
+                    report.discard_identities(retryable_identities)
+                    current = retryable
+                    continue
+                return
+            except ClientError as error:
+                code, status_code, message = self._client_error_details(error)
+                retryable_error = (
+                    code in _DELETE_RETRYABLE_ERROR_CODES
+                    or CUSTOM_ERROR_HANDLER(error)
+                    or (
+                        status_code is not None
+                        and 500 <= status_code <= 599
+                    )
+                )
+                unversioned = [obj for obj in current if not obj.get("VersionId")]
+                versioned = [obj for obj in current if obj.get("VersionId")]
+                for obj in unversioned:
+                    report.add(
+                        DeleteResult(
+                            bucket,
+                            obj["Key"],
+                            None,
+                            self._delete_error_status(code, status_code, None),
+                            error_code=code,
+                            error_message=message,
+                        )
+                    )
+                if retryable_error and versioned and attempt + 1 < retries:
+                    await asyncio.sleep(min(1.7**attempt * 0.1, 15))
+                    current = versioned
+                    continue
+                for obj in versioned:
+                    status = (
+                        DeleteStatus.RETRYABLE_FAILURE
+                        if retryable_error
+                        else self._delete_error_status(
+                            code, status_code, obj.get("VersionId")
+                        )
+                    )
+                    report.add(
+                        DeleteResult(
+                            bucket,
+                            obj["Key"],
+                            obj.get("VersionId"),
+                            status,
+                            error_code=code,
+                            error_message=message,
+                        )
+                    )
+                report.errors.append(error)
+                return
+            except S3_RETRYABLE_ERRORS as error:
+                unversioned = [obj for obj in current if not obj.get("VersionId")]
+                versioned = [obj for obj in current if obj.get("VersionId")]
+                for obj in unversioned:
+                    report.add(
+                        DeleteResult(
+                            bucket,
+                            obj["Key"],
+                            None,
+                            DeleteStatus.UNKNOWN,
+                            error_message=str(error),
+                        )
+                    )
+                if versioned and attempt + 1 < retries:
+                    await asyncio.sleep(min(1.7**attempt * 0.1, 15))
+                    current = versioned
+                    continue
+                for obj in versioned:
+                    identity = (bucket, obj["Key"], obj.get("VersionId"))
+                    report.discard_identities({identity})
+                    report.add(
+                        DeleteResult(
+                            bucket,
+                            obj["Key"],
+                            obj.get("VersionId"),
+                            DeleteStatus.RETRYABLE_FAILURE,
+                            error_message=str(error),
+                        )
+                    )
+                report.errors.append(error)
+                return
+            except Exception as error:
+                retryable_error = CUSTOM_ERROR_HANDLER(error)
+                versioned = [obj for obj in current if obj.get("VersionId")]
+                unversioned = [obj for obj in current if not obj.get("VersionId")]
+                can_retry = (
+                    retryable_error
+                    and versioned
+                    and attempt + 1 < retries
+                )
+                for obj in unversioned:
+                    report.add(
+                        DeleteResult(
+                            bucket,
+                            obj["Key"],
+                            None,
+                            DeleteStatus.UNKNOWN,
+                            error_message=str(error),
+                        )
+                    )
+                if can_retry:
+                    await asyncio.sleep(min(1.7**attempt * 0.1, 15))
+                    current = versioned
+                    continue
+                for obj in versioned:
+                    report.add(
+                        DeleteResult(
+                            bucket,
+                            obj["Key"],
+                            obj.get("VersionId"),
+                            DeleteStatus.RETRYABLE_FAILURE
+                            if retryable_error
+                            else DeleteStatus.UNKNOWN,
+                            error_message=str(error),
+                        )
+                    )
+                report.errors.append(error)
+                return
+
+    async def _delete_paths_with_report(
+        self,
+        pathlist,
+        report=None,
+        retryable_only=False,
+        retries=None,
+        **kwargs,
+    ):
+        """Delete one bucket's objects with one result per key/version.
+
+        Paths may include ``?versionId=...`` when the filesystem is version
+        aware. Automatic retries only include failed objects that specified a
+        version, because retrying a key-only delete may delete an object that
+        was created after the original request.
+
+        Parameters
+        ----------
+        pathlist : list[str]
+            Object paths to delete. Every path must be in the same bucket.
+        report : DeleteReport or None
+            Existing report to update. The same object is returned.
+        retryable_only : bool
+            Only delete paths that currently appear in
+            ``report.retryable_failures``.
+        retries : int or None
+            Number of attempts for versioned, retryable failures.
+        **kwargs
+            Additional arguments for ``delete_objects``.
+        """
+        report = report or DeleteReport()
+        if not pathlist:
+            return report
+        parsed = []
+        buckets = set()
+        for path in pathlist:
+            bucket, key, _ = self.split_path(path)
+            if not key:
+                raise ValueError("Bulk delete files should refer to files, not buckets")
+            parsed.append(self.split_path(path))
+            buckets.add(bucket)
+        if len(buckets) > 1:
+            raise ValueError("Bulk delete files should refer to only one bucket")
+        bucket = buckets.pop()
+        for path in pathlist:
+            self.invalidate_cache(self._parent(path))
+        retryable_identities = {
+            (
+                result.bucket,
+                result.key,
+                result.version_id,
+            )
+            for result in (report.retryable_failures if retryable_only else [])
+            if result.version_id
+        }
+        for start in range(0, len(parsed), MAX_BULK_DELETE_OBJECTS):
+            objects = [
+                {"Key": key, **version_id_kw(version_id)}
+                for _, key, version_id in parsed[
+                    start : start + MAX_BULK_DELETE_OBJECTS
+                ]
+                if not retryable_identities
+                or (bucket, key, version_id) in retryable_identities
+            ]
+            if objects:
+                report.discard_identities(
+                    {(bucket, obj["Key"], obj.get("VersionId")) for obj in objects}
+                )
+                await self._delete_objects_with_report(
+                    bucket,
+                    objects,
+                    report,
+                    retries=retries,
+                    **kwargs,
+                )
+        return report
+
+    bulk_delete = sync_wrapper(_delete_paths_with_report)
+
     async def _bulk_delete(self, pathlist, **kwargs):
         """
         Remove multiple keys with one call
@@ -2387,29 +2904,44 @@ class S3FileSystem(AsyncFileSystem):
         except ClientError as e:
             raise translate_boto_error(e)
 
-    async def _rm(self, path, recursive=False, **kwargs):
+    async def _rm(self, path, recursive=False, report=None, **kwargs):
+        """Delete paths, optionally collecting per-object results.
+
+        Pass a :class:`DeleteReport` to return structured results instead of
+        deleted paths. If object-version listing is interrupted, results already
+        confirmed on earlier pages remain in the report.
+        """
         if recursive and isinstance(path, str):
             bucket, key, _ = self.split_path(path)
             if not key and await self._is_bucket_versioned(bucket):
                 # special path to completely remove versioned bucket
-                await self._rm_versioned_bucket_contents(bucket)
+                cleanup_report = await self._rm_versioned_bucket_contents(
+                    bucket, report=report
+                )
+                if report is not None:
+                    return cleanup_report
         paths = await self._expand_path(path, recursive=recursive)
         files = [p for p in paths if self.split_path(p)[1]]
         dirs = [p for p in paths if not self.split_path(p)[1]]
         # TODO: fails if more than one bucket in list
-        out = await _run_coros_in_chunks(
-            [
-                self._bulk_delete(files[i : i + 1000])
-                for i in range(0, len(files), 1000)
-            ],
-            batch_size=3,
-            nofiles=True,
-        )
+        if report is not None:
+            out = [await self._delete_paths_with_report(files, report=report)]
+        else:
+            out = await _run_coros_in_chunks(
+                [
+                    self._bulk_delete(files[i : i + 1000])
+                    for i in range(0, len(files), 1000)
+                ],
+                batch_size=3,
+                nofiles=True,
+            )
         await asyncio.gather(*[self._rmdir(d) for d in dirs])
         [
             (self.invalidate_cache(p), self.invalidate_cache(self._parent(p)))
             for p in paths
         ]
+        if report is not None:
+            return report
         return sum(out, [])
 
     async def _is_bucket_versioned(self, bucket):
@@ -2430,20 +2962,39 @@ class S3FileSystem(AsyncFileSystem):
 
     make_bucket_versioned = sync_wrapper(_make_bucket_versioned)
 
-    async def _rm_versioned_bucket_contents(self, bucket):
+    async def _rm_versioned_bucket_contents(self, bucket, report=None):
         """Remove a versioned bucket and all contents"""
-        async for plist in self._list_pages(
-            "list_object_versions", Bucket=bucket, **self.req_kw
-        ):
-            obs = plist.get("Versions", []) + plist.get("DeleteMarkers", [])
-            delete_keys = {
-                "Objects": [
-                    {"Key": i["Key"], "VersionId": i["VersionId"]} for i in obs
-                ],
-                "Quiet": True,
-            }
-            if obs:
-                await self._call_s3("delete_objects", Bucket=bucket, Delete=delete_keys)
+        own_report = report is None
+        report = report or DeleteReport()
+        try:
+            async for plist in self._list_pages(
+                "list_object_versions", Bucket=bucket, **self.req_kw
+            ):
+                obs = plist.get("Versions", []) + plist.get("DeleteMarkers", [])
+                objects = [
+                    {"Key": item["Key"], "VersionId": item["VersionId"]}
+                    for item in obs
+                ]
+                if objects:
+                    for start in range(0, len(objects), MAX_BULK_DELETE_OBJECTS):
+                        batch = objects[start : start + MAX_BULK_DELETE_OBJECTS]
+                        if own_report:
+                            await self._call_s3(
+                                "delete_objects",
+                                Bucket=bucket,
+                                Delete={"Objects": batch, "Quiet": True},
+                            )
+                        else:
+                            await self._delete_objects_with_report(
+                                bucket, batch, report
+                            )
+        except Exception as error:
+            report.listing_complete = False
+            report.errors.append(error)
+            if own_report:
+                raise
+        if not own_report:
+            return report
 
     def invalidate_cache(self, path=None):
         if path is None:
