@@ -17,10 +17,15 @@ API
    S3FileSystem.mv
    S3FileSystem.open
    S3FileSystem.put
+   S3FileSystem.resume_put_file
    S3FileSystem.read_block
    S3FileSystem.rm
    S3FileSystem.tail
    S3FileSystem.touch
+
+.. autosummary::
+   export_multipart_checkpoint
+   save_multipart_checkpoint
 
 .. autosummary::
    S3File
@@ -42,6 +47,10 @@ API
 .. autoclass:: S3FileSystem
    :members:
    :inherited-members:
+
+.. autofunction:: export_multipart_checkpoint
+
+.. autofunction:: save_multipart_checkpoint
 
 .. autoclass:: S3File
    :members:

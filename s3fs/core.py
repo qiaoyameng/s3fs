@@ -1,14 +1,17 @@
 import asyncio
 import bisect
 import errno
+import hashlib
+import json
 import io
 import logging
 import math
 import mimetypes
 import os
-import socket
-import weakref
 import re
+import socket
+import tempfile
+import weakref
 
 from urllib3.exceptions import IncompleteRead
 
@@ -33,7 +36,13 @@ from botocore.exceptions import ClientError, HTTPClientError, ParamValidationErr
 from botocore.parsers import ResponseParserError
 
 from s3fs.errors import translate_boto_error
-from s3fs.utils import S3BucketRegionCache, ParamKwargsHelper, _get_brange, FileExpired
+from s3fs.utils import (
+    S3BucketRegionCache,
+    ParamKwargsHelper,
+    _get_brange,
+    FileExpired,
+    ignoring,
+)
 
 # ClientPayloadError can be thrown during an incomplete read. aiohttp is a dependency of
 # aiobotocore, we guard the import here in case this dependency is replaced in a future version
@@ -254,6 +263,108 @@ def calculate_chunksize(filesize, chunksize=None, max_parts=MAX_UPLOAD_PARTS) ->
             # so each chunk can be up to ~524 MiB.
             chunksize = math.ceil(filesize / max_parts)
     return chunksize
+
+
+CHECKPOINT_VERSION = 1
+
+
+def _canonical_json_value(value):
+    if isinstance(value, bytes):
+        return {"__bytes_sha256__": hashlib.sha256(value).hexdigest()}
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_json_value(value[key])
+            for key in sorted(value, key=str)
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_canonical_json_value(item) for item in value]
+    return value
+
+
+def _canonical_json(value):
+    return json.dumps(
+        _canonical_json_value(value), sort_keys=True, separators=(",", ":")
+    )
+
+
+def _sha256_text(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _hash_file(path, algorithm="sha256", block_size=8 * 2**20):
+    digest = hashlib.new(algorithm)
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(block_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _expected_part_size(part_number, part_count, size, chunksize):
+    if part_number == part_count:
+        return size - (part_count - 1) * chunksize
+    return chunksize
+
+
+def _normalized_etag(etag):
+    return etag.strip('"')
+
+
+def _expected_multipart_etag(parts):
+    etag_hash = hashlib.md5()
+    for part in sorted(parts, key=lambda item: item["PartNumber"]):
+        etag_hash.update(bytes.fromhex(_normalized_etag(part["ETag"])))
+    return f'{etag_hash.hexdigest()}-{len(parts)}'
+
+
+def _load_upload_checkpoint(checkpoint):
+    if isinstance(checkpoint, dict):
+        loaded = dict(checkpoint)
+    else:
+        with open(checkpoint, "r", encoding="utf-8") as checkpoint_file:
+            loaded = json.load(checkpoint_file)
+    required = (
+        "version",
+        "status",
+        "source",
+        "destination",
+        "part_plan",
+        "upload",
+    )
+    if any(key not in loaded for key in required):
+        raise ValueError("invalid multipart upload checkpoint")
+    return loaded
+
+
+def _write_upload_checkpoint(path, checkpoint):
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(path)}.", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as checkpoint_file:
+            json.dump(checkpoint, checkpoint_file, sort_keys=True)
+            checkpoint_file.write("\n")
+            checkpoint_file.flush()
+        os.replace(temporary_path, path)
+    except BaseException:
+        with ignoring(OSError):
+            os.unlink(temporary_path)
+        raise
+
+
+def export_multipart_checkpoint(checkpoint_file):
+    """Load a multipart-upload checkpoint for export to another process."""
+    return _load_upload_checkpoint(checkpoint_file)
+
+
+def save_multipart_checkpoint(checkpoint_file, checkpoint):
+    """Persist a multipart-upload checkpoint exported by another process."""
+    _write_upload_checkpoint(checkpoint_file, checkpoint)
+
+
+def _client_error_code(error):
+    return getattr(error, "response", {}).get("Error", {}).get("Code")
 
 
 class S3FileSystem(AsyncFileSystem):
@@ -1412,6 +1523,9 @@ class S3FileSystem(AsyncFileSystem):
         """
         mode=="create", exclusive write, is only known to work on AWS S3, and
         requires botocore>1.35.20
+
+        checkpoint_file : str, optional
+            Persist a JSON checkpoint for ``resume_put_file`` after restart.
         """
         bucket, key, _ = self.split_path(path)
         concurrency = max_concurrency or self.max_concurrency
@@ -1476,6 +1590,7 @@ class S3FileSystem(AsyncFileSystem):
         chunksize=None,
         max_concurrency=None,
         mode="overwrite",
+        checkpoint_file=None,
         **kwargs,
     ):
         """
@@ -1489,12 +1604,9 @@ class S3FileSystem(AsyncFileSystem):
                 return
             else:
                 await self._mkdir(lpath)
-        size = os.path.getsize(lpath)
+        source_stat = os.stat(lpath)
+        size = source_stat.st_size
         callback.set_size(size)
-        if mode == "create":
-            match = {"IfNoneMatch": "*"}
-        else:
-            match = {}
 
         if "ContentType" not in kwargs:
             content_type, _ = mimetypes.guess_type(lpath)
@@ -1502,43 +1614,68 @@ class S3FileSystem(AsyncFileSystem):
                 kwargs["ContentType"] = content_type
 
         chunksize = calculate_chunksize(size, chunksize=chunksize)
+        if math.ceil(size / chunksize) > MAX_UPLOAD_PARTS:
+            raise ValueError(
+                "chunksize would produce more than %s upload parts"
+                % MAX_UPLOAD_PARTS
+            )
         with open(lpath, "rb") as f0:
             if size < min(5 * 2**30, 2 * chunksize):
                 chunk = f0.read()
                 await self._call_s3(
-                    "put_object", Bucket=bucket, Key=key, Body=chunk, **kwargs, **match
+                    "put_object",
+                    Bucket=bucket,
+                    Key=key,
+                    Body=chunk,
+                    **kwargs,
+                    **({"IfNoneMatch": "*"} if mode == "create" else {}),
                 )
                 callback.relative_update(size)
             else:
-
-                mpu = await self._call_s3(
-                    "create_multipart_upload", Bucket=bucket, Key=key, **kwargs
-                )
-                try:
-                    out = await self._upload_file_part_concurrent(
-                        bucket,
-                        key,
-                        mpu,
+                if checkpoint_file is None:
+                    mpu = await self._call_s3(
+                        "create_multipart_upload", Bucket=bucket, Key=key, **kwargs
+                    )
+                    try:
+                        out = await self._upload_file_part_concurrent(
+                            bucket,
+                            key,
+                            mpu,
+                            f0,
+                            chunksize,
+                            callback=callback,
+                            max_concurrency=max_concurrency,
+                        )
+                        parts = [
+                            {
+                                "PartNumber": part["PartNumber"],
+                                "ETag": part["ETag"],
+                            }
+                            for part in out.values()
+                        ]
+                        await self._call_s3(
+                            "complete_multipart_upload",
+                            Bucket=bucket,
+                            Key=key,
+                            UploadId=mpu["UploadId"],
+                            MultipartUpload={"Parts": parts},
+                            **({"IfNoneMatch": "*"} if mode == "create" else {}),
+                        )
+                    except Exception:
+                        await self._abort_mpu(bucket, key, mpu["UploadId"])
+                        raise
+                else:
+                    await self._put_file_with_checkpoint(
                         f0,
+                        source_stat,
+                        rpath,
                         chunksize,
+                        kwargs,
+                        checkpoint_file,
                         callback=callback,
                         max_concurrency=max_concurrency,
+                        mode=mode,
                     )
-                    parts = [
-                        {"PartNumber": i + 1, "ETag": o["ETag"]}
-                        for i, o in enumerate(out)
-                    ]
-                    await self._call_s3(
-                        "complete_multipart_upload",
-                        Bucket=bucket,
-                        Key=key,
-                        UploadId=mpu["UploadId"],
-                        MultipartUpload={"Parts": parts},
-                        **match,
-                    )
-                except Exception:
-                    await self._abort_mpu(bucket, key, mpu["UploadId"])
-                    raise
         while rpath:
             self.invalidate_cache(rpath)
             rpath = self._parent(rpath)
@@ -1552,10 +1689,19 @@ class S3FileSystem(AsyncFileSystem):
         chunksize,
         callback=_DEFAULT_CALLBACK,
         max_concurrency=None,
+        part_numbers=None,
+        total_parts=None,
+        save_checkpoint=None,
     ):
         max_concurrency = max_concurrency or self.max_concurrency
         if max_concurrency < 1:
             raise ValueError("max_concurrency must be >= 1")
+        sequential_parts = part_numbers is None and total_parts is None
+        if sequential_parts:
+            part_numbers = None
+        else:
+            part_numbers = set(part_numbers or range(1, (total_parts or 0) + 1))
+            total_parts = total_parts or len(part_numbers)
 
         async def _upload_chunk(chunk, part_number):
             result = await self._call_s3(
@@ -1567,26 +1713,409 @@ class S3FileSystem(AsyncFileSystem):
                 Key=key,
             )
             callback.relative_update(len(chunk))
-            return result
+            part = {
+                "PartNumber": part_number,
+                "ETag": result["ETag"],
+                "Size": len(chunk),
+            }
+            if "ChecksumSHA256" in result:
+                part["ChecksumSHA256"] = result["ChecksumSHA256"]
+            return part
 
-        out = []
+        out = {}
+        pending_parts = set(part_numbers or [])
+        next_part_number = min(pending_parts) if pending_parts else 1
         while True:
             chunks = []
-            for i in range(max_concurrency):
-                chunk = f0.read(chunksize)
-                if chunk:
-                    chunks.append(chunk)
+            if sequential_parts:
+                for _ in range(max_concurrency):
+                    chunk = f0.read(chunksize)
+                    if chunk:
+                        chunks.append((next_part_number, chunk))
+                        next_part_number += 1
+            else:
+                while pending_parts and len(chunks) < max_concurrency:
+                    part_number = min(pending_parts)
+                    pending_parts.remove(part_number)
+                    f0.seek((part_number - 1) * chunksize)
+                    chunks.append((part_number, f0.read(chunksize)))
             if not chunks:
                 break
-            out.extend(
-                await asyncio.gather(
+            try:
+                uploaded = await asyncio.gather(
                     *[
-                        _upload_chunk(chunk, len(out) + i)
-                        for i, chunk in enumerate(chunks, 1)
+                        _upload_chunk(chunk, current_part)
+                        for current_part, chunk in chunks
                     ]
                 )
-            )
+            except Exception:
+                pending_parts.update(number for number, _ in chunks)
+                raise
+            for part in uploaded:
+                out[part["PartNumber"]] = part
+            if save_checkpoint is not None:
+                save_checkpoint(out)
         return out
+
+    async def _upload_kwargs_fingerprint(self, bucket, key, kwargs, mode):
+        await self.set_session()
+        s3 = await self.get_s3(bucket)
+        model = s3.meta.service_model.operation_model("CreateMultipartUpload")
+        valid_keys = set(model.input_shape.members)
+        request_kwargs = self.s3_additional_kwargs.copy()
+        request_kwargs.update(kwargs)
+        filtered_kwargs = {
+            name: value
+            for name, value in request_kwargs.items()
+            if name in valid_keys and value is not None
+        }
+        return _sha256_text(
+            _canonical_json(
+                {
+                    "Bucket": bucket,
+                    "Key": key,
+                    "Mode": mode,
+                    "Parameters": filtered_kwargs,
+                }
+            )
+        )
+
+    def _make_upload_checkpoint(
+        self, lpath, source_stat, rpath, size, chunksize, kwargs, mode, fingerprint
+    ):
+        bucket, key, _ = self.split_path(rpath)
+        return {
+            "version": CHECKPOINT_VERSION,
+            "status": "new",
+            "source": {
+                "path": os.path.abspath(lpath),
+                "size": size,
+                "sha256": None,
+                "mtime_ns": source_stat.st_mtime_ns,
+                "inode": source_stat.st_ino,
+                "device": source_stat.st_dev,
+            },
+            "destination": {"Bucket": bucket, "Key": key, "Path": rpath},
+            "part_plan": {
+                "size": size,
+                "chunksize": chunksize,
+                "part_count": math.ceil(size / chunksize),
+            },
+            "upload": {"upload_id": None, "parts": []},
+            "request_fingerprint": fingerprint,
+            "create_kwargs_hash": _sha256_text(_canonical_json(kwargs)),
+            "mode": mode,
+        }
+
+    async def _put_file_with_checkpoint(
+        self,
+        f0,
+        source_stat,
+        rpath,
+        chunksize,
+        kwargs,
+        checkpoint_file,
+        callback=_DEFAULT_CALLBACK,
+        max_concurrency=None,
+        mode="overwrite",
+    ):
+        lpath = f0.name
+        bucket, key, _ = self.split_path(rpath)
+        size = source_stat.st_size
+        part_count = math.ceil(size / chunksize)
+        if kwargs.get("SSECustomerAlgorithm"):
+            raise ValueError(
+                "resumable checkpoints do not support SSECustomerAlgorithm"
+            )
+        fingerprint = await self._upload_kwargs_fingerprint(bucket, key, kwargs, mode)
+        checkpoint = self._make_upload_checkpoint(
+            lpath, source_stat, rpath, size, chunksize, kwargs, mode, fingerprint
+        )
+        checkpoint["source"]["sha256"] = _hash_file(lpath)
+        checkpoint["status"] = "new"
+        _write_upload_checkpoint(checkpoint_file, checkpoint)
+
+        mpu = await self._call_s3(
+            "create_multipart_upload", Bucket=bucket, Key=key, **kwargs
+        )
+        checkpoint["upload"]["upload_id"] = mpu["UploadId"]
+        checkpoint["status"] = "uploading"
+        _write_upload_checkpoint(checkpoint_file, checkpoint)
+
+        def save_parts(uploaded=None):
+            if uploaded:
+                checkpoint["upload"]["parts"] = list(uploaded.values())
+            checkpoint["upload"]["parts"] = sorted(
+                checkpoint["upload"]["parts"], key=lambda part: part["PartNumber"]
+            )
+            _write_upload_checkpoint(checkpoint_file, checkpoint)
+
+        uploaded = await self._upload_file_part_concurrent(
+            bucket,
+            key,
+            mpu,
+            f0,
+            chunksize,
+            callback=callback,
+            max_concurrency=max_concurrency,
+            part_numbers=set(range(1, part_count + 1)),
+            total_parts=part_count,
+            save_checkpoint=save_parts,
+        )
+        checkpoint["upload"]["parts"] = sorted(
+            uploaded.values(), key=lambda part: part["PartNumber"]
+        )
+        checkpoint["status"] = "completing"
+        _write_upload_checkpoint(checkpoint_file, checkpoint)
+        await self._complete_checkpoint_upload(checkpoint, kwargs)
+        _write_upload_checkpoint(checkpoint_file, checkpoint)
+
+    async def _list_all_parts(self, bucket, key, upload_id):
+        parts = []
+        marker = None
+        while True:
+            kwargs = {
+                "Bucket": bucket,
+                "Key": key,
+                "UploadId": upload_id,
+                "MaxParts": 1000,
+            }
+            if marker is not None:
+                kwargs["PartNumberMarker"] = str(marker)
+            response = await self._call_s3("list_parts", **kwargs)
+            parts.extend(response.get("Parts", []))
+            if not response.get("IsTruncated"):
+                return parts
+            marker = response.get("NextPartNumberMarker", marker)
+
+    async def _head_completed_checkpoint_object(self, checkpoint, kwargs):
+        bucket = checkpoint["destination"]["Bucket"]
+        key = checkpoint["destination"]["Key"]
+        try:
+            head = await self._call_s3(
+                "head_object", Bucket=bucket, Key=key, **kwargs
+            )
+        except Exception:
+            return None
+        if head.get("ContentLength") != checkpoint["part_plan"]["size"]:
+            return None
+        parts = checkpoint["upload"]["parts"]
+        etag = _normalized_etag(head.get("ETag", ""))
+        expected_etag = _normalized_etag(_expected_multipart_etag(parts))
+        if etag != expected_etag:
+            return None
+        return head
+
+    async def _complete_checkpoint_upload(self, checkpoint, kwargs):
+        bucket = checkpoint["destination"]["Bucket"]
+        key = checkpoint["destination"]["Key"]
+        upload_id = checkpoint["upload"]["upload_id"]
+        parts = [
+            {"PartNumber": part["PartNumber"], "ETag": part["ETag"]}
+            for part in sorted(
+                checkpoint["upload"]["parts"], key=lambda item: item["PartNumber"]
+            )
+        ]
+        match = {"IfNoneMatch": "*"} if checkpoint.get("mode") == "create" else {}
+        for attempt in range(2):
+            try:
+                await self._call_s3(
+                    "complete_multipart_upload",
+                    Bucket=bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                    MultipartUpload={"Parts": parts},
+                    **match,
+                )
+                checkpoint["status"] = "completed"
+                return
+            except ClientError as error:
+                if _client_error_code(error) not in {"NoSuchUpload", "InvalidPart"}:
+                    raise
+                if await self._head_completed_checkpoint_object(checkpoint, kwargs):
+                    checkpoint["status"] = "completed"
+                    return
+                raise
+            except Exception:
+                if await self._head_completed_checkpoint_object(checkpoint, kwargs):
+                    checkpoint["status"] = "completed"
+                    return
+                if attempt == 1:
+                    raise
+
+    async def _resume_put_file(
+        self,
+        checkpoint,
+        checkpoint_file=None,
+        lpath=None,
+        rpath=None,
+        callback=_DEFAULT_CALLBACK,
+        chunksize=None,
+        max_concurrency=None,
+        mode=None,
+        **kwargs,
+    ):
+        checkpoint = _load_upload_checkpoint(checkpoint)
+        if checkpoint.get("version") != CHECKPOINT_VERSION:
+            raise ValueError("unsupported upload checkpoint version")
+        if checkpoint.get("status") == "completed":
+            return
+        if checkpoint_file is None:
+            raise ValueError("checkpoint_file is required to update a resume checkpoint")
+
+        source = checkpoint["source"]
+        lpath = os.path.abspath(lpath or source["path"])
+        if os.path.abspath(source["path"]) != lpath:
+            raise ValueError("checkpoint source path does not match lpath")
+        source_stat = os.stat(lpath)
+        if source_stat.st_size != source["size"]:
+            raise ValueError("source file size changed; refusing to resume upload")
+        if _hash_file(lpath) != source["sha256"]:
+            raise ValueError("source file content changed; refusing to resume upload")
+
+        destination = checkpoint["destination"]
+        if rpath is not None and rpath != destination["Path"]:
+            raise ValueError("checkpoint destination path does not match rpath")
+        rpath = destination["Path"]
+        bucket, key, _ = self.split_path(rpath)
+        if bucket != destination["Bucket"] or key != destination["Key"]:
+            raise ValueError("checkpoint destination identity changed")
+
+        plan = checkpoint["part_plan"]
+        chunksize = (
+            plan["chunksize"]
+            if chunksize is None
+            else calculate_chunksize(plan["size"], chunksize=chunksize)
+        )
+        if chunksize != plan["chunksize"]:
+            raise ValueError("chunksize changed; refusing to resume upload")
+        part_count = math.ceil(plan["size"] / chunksize)
+        if part_count != plan["part_count"]:
+            raise ValueError("multipart part plan changed")
+
+        mode = checkpoint.get("mode") if mode is None else mode
+        if mode != checkpoint.get("mode"):
+            raise ValueError("upload mode changed; refusing to resume upload")
+        if "ContentType" not in kwargs:
+            content_type, _ = mimetypes.guess_type(lpath)
+            if content_type is not None:
+                kwargs["ContentType"] = content_type
+        if _sha256_text(_canonical_json(kwargs)) != checkpoint.get("create_kwargs_hash"):
+            raise ValueError("upload parameters changed; refusing to resume upload")
+        if kwargs.get("SSECustomerAlgorithm"):
+            raise ValueError(
+                "resumable checkpoints do not support SSECustomerAlgorithm"
+            )
+        fingerprint = await self._upload_kwargs_fingerprint(bucket, key, kwargs, mode)
+        if fingerprint != checkpoint.get("request_fingerprint"):
+            raise ValueError("upload request parameters changed")
+
+        upload_id = checkpoint["upload"].get("upload_id")
+        if not upload_id or checkpoint.get("status") not in {"uploading", "completing"}:
+            raise ValueError("checkpoint does not contain a resumable upload")
+
+        callback.set_size(plan["size"])
+        if checkpoint.get("status") == "completing":
+            head = await self._head_completed_checkpoint_object(checkpoint, kwargs)
+            if head is not None:
+                checkpoint["status"] = "completed"
+                if checkpoint_file is not None:
+                    _write_upload_checkpoint(checkpoint_file, checkpoint)
+                self.invalidate_cache(destination["Path"])
+                return
+
+        try:
+            server_parts = await self._list_all_parts(bucket, key, upload_id)
+        except ClientError as error:
+            if _client_error_code(error) == "NoSuchUpload":
+                raise ValueError("multipart upload is no longer valid") from error
+            raise
+
+        server_by_number = {part["PartNumber"]: part for part in server_parts}
+        confirmed = {}
+        for part in checkpoint["upload"]["parts"]:
+            number = part["PartNumber"]
+            server_part = server_by_number.get(number)
+            if server_part is None:
+                continue
+            if _normalized_etag(server_part.get("ETag", "")) != _normalized_etag(
+                part["ETag"]
+            ):
+                raise ValueError("server part ETag changed; refusing to resume upload")
+            if server_part.get("Size") != part.get("Size"):
+                raise ValueError("server part size changed; refusing to resume upload")
+            confirmed[number] = part
+
+        with open(lpath, "rb") as source_file:
+            for number, server_part in server_by_number.items():
+                if number < 1 or number > part_count:
+                    raise ValueError("server returned an unexpected part number")
+                expected_size = _expected_part_size(
+                    number, part_count, plan["size"], chunksize
+                )
+                if server_part.get("Size") != expected_size:
+                    raise ValueError("server part size does not match part plan")
+                if number in confirmed:
+                    continue
+                source_file.seek((number - 1) * chunksize)
+                expected_etag = hashlib.md5(source_file.read(chunksize)).hexdigest()
+                if _normalized_etag(server_part.get("ETag", "")) != expected_etag:
+                    raise ValueError("server part content does not match source file")
+                confirmed[number] = {
+                    "PartNumber": number,
+                    "ETag": server_part["ETag"],
+                    "Size": expected_size,
+                }
+
+        callback.relative_update(
+            sum(
+                _expected_part_size(number, part_count, plan["size"], chunksize)
+                for number in confirmed
+            )
+        )
+
+        missing = sorted(set(range(1, part_count + 1)) - set(confirmed))
+        checkpoint["upload"]["parts"] = sorted(
+            confirmed.values(), key=lambda part: part["PartNumber"]
+        )
+        checkpoint["status"] = "uploading"
+        _write_upload_checkpoint(checkpoint_file, checkpoint)
+
+        with open(lpath, "rb") as source_file:
+            def save_parts(uploaded=None):
+                if uploaded:
+                    for number, part in uploaded.items():
+                        confirmed[number] = part
+                checkpoint["upload"]["parts"] = sorted(
+                    confirmed.values(), key=lambda part: part["PartNumber"]
+                )
+                _write_upload_checkpoint(checkpoint_file, checkpoint)
+
+            uploaded = await self._upload_file_part_concurrent(
+                bucket,
+                key,
+                {"UploadId": upload_id},
+                source_file,
+                chunksize,
+                callback=callback,
+                max_concurrency=max_concurrency,
+                part_numbers=set(missing),
+                total_parts=part_count,
+                save_checkpoint=save_parts,
+            )
+        checkpoint["upload"]["parts"] = sorted(
+            confirmed.values(), key=lambda part: part["PartNumber"]
+        )
+        if len(checkpoint["upload"]["parts"]) != part_count:
+            raise ValueError("multipart upload is missing confirmed parts")
+        checkpoint["status"] = "completing"
+        _write_upload_checkpoint(checkpoint_file, checkpoint)
+        await self._complete_checkpoint_upload(checkpoint, kwargs)
+        _write_upload_checkpoint(checkpoint_file, checkpoint)
+
+        self.invalidate_cache(destination["Path"])
+
+    resume_put_file = sync_wrapper(_resume_put_file)
 
     async def _download_file_part_concurrent(
         self,

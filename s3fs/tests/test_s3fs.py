@@ -20,6 +20,7 @@ from dateutil.tz import tzutc
 
 import botocore
 import s3fs.core
+from s3fs import export_multipart_checkpoint, save_multipart_checkpoint
 from s3fs.core import MAX_UPLOAD_PARTS, S3FileSystem, calculate_chunksize
 from s3fs.utils import ignoring, SSEParams, FileExpired
 from botocore.exceptions import NoCredentialsError
@@ -1195,6 +1196,175 @@ def test_put_file_does_not_truncate(s3, tmpdir, factor):
         test_file, test_bucket_name + "/temp", max_concurrency=5, chunksize=chunksize
     )
     assert s3.size(test_bucket_name + "/temp") == factor * chunksize
+
+
+def test_put_file_checkpoint_resume_after_lost_part_response(s3, tmpdir, monkeypatch):
+    chunksize = 4 * 2**20
+    data = os.urandom(3 * chunksize)
+    source = str(tmpdir.join("large.bin"))
+    checkpoint_path = str(tmpdir.join("large.checkpoint.json"))
+    remote = test_bucket_name + "/checkpoint/large.bin"
+    with open(source, "wb") as f:
+        f.write(data)
+
+    calls = {"upload_part": 0}
+    original_call_s3 = s3._call_s3
+
+    async def fail_first_part(method, *args, **kwargs):
+        if method == "upload_part":
+            calls["upload_part"] += 1
+            result = await original_call_s3(method, *args, **kwargs)
+            if calls["upload_part"] == 1:
+                raise ConnectionError("upload succeeded but response was lost")
+            return result
+        return await original_call_s3(method, *args, **kwargs)
+
+    monkeypatch.setattr(s3, "_call_s3", fail_first_part)
+    s3.put_file(
+        source,
+        remote,
+        chunksize=chunksize,
+        max_concurrency=1,
+        checkpoint_file=checkpoint_path,
+    )
+
+    checkpoint = export_multipart_checkpoint(checkpoint_path)
+    exported_path = str(tmpdir.join("exported.checkpoint.json"))
+    save_multipart_checkpoint(exported_path, checkpoint)
+    assert checkpoint["upload"]["parts"] == []
+    assert checkpoint["part_plan"] == {
+        "size": len(data),
+        "chunksize": chunksize,
+        "part_count": 3,
+    }
+
+    resumed = S3FileSystem(
+        anon=False, client_kwargs={"endpoint_url": endpoint_uri}
+    )
+    resumed_calls = {"upload_part": 0}
+    original_resumed_call_s3 = resumed._call_s3
+
+    async def count_uploads(method, *args, **kwargs):
+        if method == "upload_part":
+            resumed_calls["upload_part"] += 1
+            assert kwargs["PartNumber"] != 1
+        return await original_resumed_call_s3(method, *args, **kwargs)
+
+    monkeypatch.setattr(resumed, "_call_s3", count_uploads)
+    resumed.resume_put_file(exported_path, exported_path)
+
+    assert resumed_calls["upload_part"] == 2
+    assert s3.cat(remote) == data
+    completed = export_multipart_checkpoint(exported_path)
+    assert completed["status"] == "completed"
+
+
+def test_put_file_checkpoint_complete_response_lost(s3, tmpdir, monkeypatch):
+    chunksize = 4 * 2**20
+    data = os.urandom(3 * chunksize)
+    source = str(tmpdir.join("complete.bin"))
+    checkpoint_path = str(tmpdir.join("complete.checkpoint.json"))
+    remote = test_bucket_name + "/checkpoint/complete.bin"
+    with open(source, "wb") as f:
+        f.write(data)
+
+    calls = {"complete": 0, "head": 0, "upload_part": 0}
+    original_call_s3 = s3._call_s3
+
+    async def lose_complete_response(method, *args, **kwargs):
+        calls[method] = calls.get(method, 0) + 1
+        result = await original_call_s3(method, *args, **kwargs)
+        if method == "complete_multipart_upload":
+            raise ConnectionError("complete succeeded but response was lost")
+        return result
+
+    monkeypatch.setattr(s3, "_call_s3", lose_complete_response)
+    with pytest.raises(ConnectionError):
+        s3.put_file(
+            source,
+            remote,
+            chunksize=chunksize,
+            max_concurrency=1,
+            checkpoint_file=checkpoint_path,
+        )
+
+    resumed = S3FileSystem(
+        anon=False, client_kwargs={"endpoint_url": endpoint_uri}
+    )
+    resumed_calls = {"complete": 0, "head": 0, "upload_part": 0}
+    original_resumed_call_s3 = resumed._call_s3
+
+    async def observe_resume(method, *args, **kwargs):
+        resumed_calls[method] = resumed_calls.get(method, 0) + 1
+        return await original_resumed_call_s3(method, *args, **kwargs)
+
+    monkeypatch.setattr(resumed, "_call_s3", observe_resume)
+    resumed.resume_put_file(checkpoint_path, checkpoint_path)
+
+    assert resumed_calls["head_object"] == 1
+    assert resumed_calls["upload_part"] == 0
+    assert resumed_calls["complete_multipart_upload"] == 0
+    assert s3.cat(remote) == data
+
+
+def test_put_file_checkpoint_rejects_unsafe_resume(s3, tmpdir):
+    chunksize = 4 * 2**20
+    data = os.urandom(3 * chunksize)
+    source = str(tmpdir.join("unsafe.bin"))
+    checkpoint_path = str(tmpdir.join("unsafe.checkpoint.json"))
+    remote = test_bucket_name + "/checkpoint/unsafe.bin"
+    with open(source, "wb") as f:
+        f.write(data)
+
+    calls = {"upload_part": 0}
+    original_call_s3 = s3._call_s3
+
+    async def fail_first_part(method, *args, **kwargs):
+        result = await original_call_s3(method, *args, **kwargs)
+        if method == "upload_part":
+            calls["upload_part"] += 1
+            if calls["upload_part"] == 1:
+                raise ConnectionError("lost response")
+        return result
+
+    s3._call_s3 = fail_first_part
+    try:
+        with pytest.raises(ConnectionError):
+            s3.put_file(
+                source,
+                remote,
+                chunksize=chunksize,
+                max_concurrency=1,
+                checkpoint_file=checkpoint_path,
+            )
+    finally:
+        s3._call_s3 = original_call_s3
+
+    upload_id = export_multipart_checkpoint(checkpoint_path)["upload"]["upload_id"]
+    with open(source, "r+b") as f:
+        f.seek(0)
+        f.write(b"changed")
+    with pytest.raises(ValueError, match="content changed"):
+        s3.resume_put_file(checkpoint_path, checkpoint_path)
+
+    with open(source, "wb") as f:
+        f.write(data)
+    with pytest.raises(ValueError, match="chunksize changed"):
+        s3.resume_put_file(
+            checkpoint_path,
+            checkpoint_path,
+            chunksize=5 * 2**20,
+        )
+    with pytest.raises(ValueError, match="parameters changed"):
+        s3.resume_put_file(
+            checkpoint_path,
+            checkpoint_path,
+            Metadata={"checkpoint": "changed"},
+        )
+
+    s3.abort_mpu(test_bucket_name, "checkpoint/unsafe.bin", upload_id)
+    with pytest.raises(ValueError, match="no longer valid"):
+        s3.resume_put_file(checkpoint_path, checkpoint_path)
 
 
 @pytest.mark.parametrize("size", [2**10, 2**20, 10 * 2**20])
