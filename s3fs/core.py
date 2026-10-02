@@ -33,7 +33,13 @@ from botocore.exceptions import ClientError, HTTPClientError, ParamValidationErr
 from botocore.parsers import ResponseParserError
 
 from s3fs.errors import translate_boto_error
-from s3fs.utils import S3BucketRegionCache, ParamKwargsHelper, _get_brange, FileExpired
+from s3fs.utils import (
+    S3BucketRegionCache,
+    ParamKwargsHelper,
+    _get_brange,
+    FileExpired,
+    ignoring,
+)
 
 # ClientPayloadError can be thrown during an incomplete read. aiohttp is a dependency of
 # aiobotocore, we guard the import here in case this dependency is replaced in a future version
@@ -70,6 +76,9 @@ S3_RETRYABLE_ERRORS = (
 )
 
 MAX_UPLOAD_PARTS = 10_000  # maximum number of parts for S3 multipart upload
+
+MERGE_PART_MIN = 5 * 2**20  # minimum size of a merge part (S3 rule, except last)
+MERGE_PART_MAX = 5 * 2**30  # maximum size of a single (copied) part
 
 if ClientPayloadError is not None:
     S3_RETRYABLE_ERRORS += (ClientPayloadError,)
@@ -214,6 +223,69 @@ async def _error_wrapper(func, *, args=(), kwargs=None, retries):
                 err = e
     err = translate_boto_error(err)
     raise err
+
+
+async def _gather_or_raise(*coros):
+    """Gather coroutines, waiting for all of them even if some fail.
+
+    The first exception (in argument order) is raised only once every
+    coroutine has finished, so no task is left running in the background.
+    """
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
+def _plan_merge_parts(sizes, min_part=MERGE_PART_MIN, max_part=MERGE_PART_MAX):
+    """Plan the parts of a merge multipart upload.
+
+    Given the ordered sizes of the source objects, returns a list of parts.
+    Each part is either ``("copy", index, start, end)`` - a server-side copy
+    of the byte range ``[start, end)`` of source ``index`` - or
+    ``("upload", [(index, start, end), ...])`` - content that must be
+    downloaded and re-uploaded because it cannot form a legal part by a
+    server-side copy alone. Every part except the last one is >= ``min_part``
+    bytes; the last part follows the S3 rules and may be smaller.
+    """
+    parts = []
+    pending = []
+    pending_size = 0
+
+    def flush_pending():
+        nonlocal pending, pending_size
+        if pending:
+            parts.append(("upload", pending))
+            pending = []
+            pending_size = 0
+
+    for i, size in enumerate(sizes):
+        offset = 0
+        if pending and size:
+            # top up the pending buffer with the head of this object, so
+            # that only boundary content is ever downloaded
+            take = min(min_part - pending_size, size)
+            pending.append((i, 0, take))
+            pending_size += take
+            offset = take
+        if pending_size >= min_part:
+            flush_pending()
+        while size - offset > max_part:
+            take = max_part
+            if size - offset - max_part < min_part:
+                # keep the final chunk of this object a legal part
+                take = size - offset - min_part
+            parts.append(("copy", i, offset, offset + take))
+            offset += take
+        if size - offset >= min_part:
+            parts.append(("copy", i, offset, size))
+            offset = size
+        if offset < size:
+            pending.append((i, offset, size))
+            pending_size += size - offset
+    flush_pending()
+    return parts
 
 
 def version_id_kw(version_id):
@@ -2127,8 +2199,20 @@ class S3FileSystem(AsyncFileSystem):
     async def _merge(self, path, filelist, **kwargs):
         """Create single S3 file from list of S3 files
 
-        Uses multi-part, no data is downloaded. The original files are
-        not deleted.
+        Uses a multi-part upload and copies as much as possible server-side:
+        any source object (or contiguous range of one) that can form a legal
+        S3 part on its own (>= 5 MiB) is copied with ``upload_part_copy`` and
+        never downloaded. Only boundary content that cannot be a legal part
+        by itself is downloaded and re-uploaded, glued together with its
+        neighbours; the final part follows the S3 rules and may be smaller
+        than the minimum part size.
+
+        Every source is pinned to a selected version (the one given in its
+        path, or else the current version when the merge starts) and the
+        merge fails if any source changes while it is in progress. If
+        anything fails, the incomplete multipart upload is aborted, so a
+        pre-existing target object is never left half-written. The original
+        files are not deleted.
 
         Parameters
         ----------
@@ -2140,39 +2224,177 @@ class S3FileSystem(AsyncFileSystem):
         bucket, key, version_id = self.split_path(path)
         if version_id:
             raise ValueError("Cannot write to an explicit versioned file!")
+        if not filelist:
+            raise ValueError("Cannot merge an empty list of files")
+
+        # pin every source to a concrete version before starting
+        sources = await _gather_or_raise(
+            *(self._merge_source_info(f, kwargs) for f in filelist)
+        )
+        parts = _plan_merge_parts([s["size"] for s in sources])
+        if not parts:
+            # all sources are empty: the merge is an empty object
+            await self._call_s3(
+                "put_object", kwargs, Bucket=bucket, Key=key, Body=b""
+            )
+            self.invalidate_cache(path)
+            return
+        if len(parts) > MAX_UPLOAD_PARTS:
+            raise ValueError(
+                "Merging %d files would require %d parts, more than the "
+                "maximum of %d" % (len(filelist), len(parts), MAX_UPLOAD_PARTS)
+            )
+
         mpu = await self._call_s3(
             "create_multipart_upload", kwargs, Bucket=bucket, Key=key
         )
-        # TODO: Make this support versions?
-        out = await asyncio.gather(
-            *[
-                self._call_s3(
+        upload_id = mpu["UploadId"]
+        try:
+            semaphore = asyncio.Semaphore(self.max_concurrency)
+            etags = await _gather_or_raise(
+                *(
+                    self._merge_part(
+                        bucket,
+                        key,
+                        upload_id,
+                        i + 1,
+                        part,
+                        sources,
+                        semaphore,
+                        kwargs,
+                    )
+                    for (i, part) in enumerate(parts)
+                )
+            )
+            # fail if any source changed while the merge was in progress
+            await _gather_or_raise(
+                *(self._merge_check_source(s, kwargs) for s in sources)
+            )
+            part_info = {
+                "Parts": [
+                    {"PartNumber": i + 1, "ETag": etag}
+                    for (i, etag) in enumerate(etags)
+                ]
+            }
+            await self._call_s3(
+                "complete_multipart_upload",
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                MultipartUpload=part_info,
+            )
+        except BaseException:
+            with ignoring(Exception):
+                await self._call_s3(
+                    "abort_multipart_upload",
+                    Bucket=bucket,
+                    Key=key,
+                    UploadId=upload_id,
+                )
+            raise
+        self.invalidate_cache(path)
+
+    merge = sync_wrapper(_merge)
+
+    async def _merge_source_info(self, path, kwargs):
+        """Resolve a merge source to its pinned version, etag and size."""
+        bucket, key, version_id = self.split_path(path)
+        if not key:
+            raise ValueError("Cannot merge non key-like path: %s" % path)
+        head = await self._call_s3(
+            "head_object", kwargs, Bucket=bucket, Key=key, **version_id_kw(version_id)
+        )
+        return {
+            "bucket": bucket,
+            "key": key,
+            "version_id": head.get("VersionId", version_id),
+            "explicit": version_id is not None,
+            "etag": head.get("ETag"),
+            "size": head["ContentLength"],
+        }
+
+    async def _merge_check_source(self, source, kwargs):
+        """Verify that a pinned merge source has not changed.
+
+        Sources pinned to an explicitly selected version are immutable and
+        need no check; for the others, the current version (or, on
+        unversioned buckets, the etag) must still be the pinned one.
+        """
+        if source["explicit"]:
+            return
+        try:
+            head = await self._call_s3(
+                "head_object", kwargs, Bucket=source["bucket"], Key=source["key"]
+            )
+        except Exception:
+            head = None
+        if head is None:
+            unchanged = False
+        elif source["version_id"] is not None:
+            unchanged = head.get("VersionId") == source["version_id"]
+        else:
+            unchanged = head.get("ETag") == source["etag"]
+        if not unchanged:
+            raise FileExpired(
+                "s3://%s/%s" % (source["bucket"], source["key"]),
+                source["etag"],
+            )
+
+    async def _merge_part(
+        self, bucket, key, upload_id, part_number, part, sources, semaphore, kwargs
+    ):
+        """Upload one planned merge part, returning its ETag."""
+        async with semaphore:
+            if part[0] == "copy":
+                _, index, start, end = part
+                source = sources[index]
+                copy_source = {"Bucket": source["bucket"], "Key": source["key"]}
+                if source["version_id"] is not None:
+                    copy_source["VersionId"] = source["version_id"]
+                extra = {}
+                if start or end < source["size"]:
+                    extra["CopySourceRange"] = "bytes=%d-%d" % (start, end - 1)
+                if source["etag"] is not None:
+                    extra["CopySourceIfMatch"] = source["etag"]
+                out = await self._call_s3(
                     "upload_part_copy",
                     kwargs,
                     Bucket=bucket,
                     Key=key,
-                    UploadId=mpu["UploadId"],
-                    CopySource=f,
-                    PartNumber=i + 1,
+                    UploadId=upload_id,
+                    PartNumber=part_number,
+                    CopySource=copy_source,
+                    **extra,
                 )
-                for (i, f) in enumerate(filelist)
-            ]
-        )
-        parts = [
-            {"PartNumber": i + 1, "ETag": o["CopyPartResult"]["ETag"]}
-            for (i, o) in enumerate(out)
-        ]
-        part_info = {"Parts": parts}
-        await self._call_s3(
-            "complete_multipart_upload",
-            Bucket=bucket,
-            Key=key,
-            UploadId=mpu["UploadId"],
-            MultipartUpload=part_info,
-        )
-        self.invalidate_cache(path)
-
-    merge = sync_wrapper(_merge)
+                return out["CopyPartResult"]["ETag"]
+            buffers = []
+            for index, start, end in part[1]:
+                source = sources[index]
+                get_kwargs = {}
+                if start or end < source["size"]:
+                    get_kwargs["Range"] = "bytes=%d-%d" % (start, end - 1)
+                resp = await self._call_s3(
+                    "get_object",
+                    kwargs,
+                    Bucket=source["bucket"],
+                    Key=source["key"],
+                    **version_id_kw(source["version_id"]),
+                    **get_kwargs,
+                )
+                try:
+                    buffers.append(await resp["Body"].read())
+                finally:
+                    resp["Body"].close()
+            out = await self._call_s3(
+                "upload_part",
+                kwargs,
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id,
+                PartNumber=part_number,
+                Body=b"".join(buffers),
+            )
+            return out["ETag"]
 
     async def _copy_basic(self, path1, path2, **kwargs):
         """Copy file between locations on S3

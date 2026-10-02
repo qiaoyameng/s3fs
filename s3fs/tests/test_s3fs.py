@@ -1599,6 +1599,169 @@ def test_merge(s3):
     assert s3.info(test_bucket_name + "/joined")["size"] == 2 * 10 * 2**20
 
 
+def test_plan_merge_parts():
+    M = s3fs.core.MERGE_PART_MIN
+    G = s3fs.core.MERGE_PART_MAX
+    # objects big enough to be a legal part are pure server-side copies
+    assert s3fs.core._plan_merge_parts([M, 6 * M]) == [
+        ("copy", 0, 0, M),
+        ("copy", 1, 0, 6 * M),
+    ]
+    # small files are glued together; only the boundary head of the next
+    # object is downloaded, its tail is copied server-side
+    assert s3fs.core._plan_merge_parts([2 * 2**20, 8 * 2**20]) == [
+        ("upload", [(0, 0, 2 * 2**20), (1, 0, 3 * 2**20)]),
+        ("copy", 1, 3 * 2**20, 8 * 2**20),
+    ]
+    # the last part follows the S3 rules and may be smaller than the minimum
+    assert s3fs.core._plan_merge_parts([6 * M, 10]) == [
+        ("copy", 0, 0, 6 * M),
+        ("upload", [(1, 0, 10)]),
+    ]
+    # a tail too small to be a legal part is downloaded, not copied
+    assert s3fs.core._plan_merge_parts([1, M + 5]) == [
+        ("upload", [(0, 0, 1), (1, 0, M - 1)]),
+        ("upload", [(1, M - 1, M + 5)]),
+    ]
+    # oversized objects are split into legal copy parts
+    assert s3fs.core._plan_merge_parts([2 * G + 3 * M]) == [
+        ("copy", 0, 0, G),
+        ("copy", 0, G, 2 * G),
+        ("copy", 0, 2 * G, 2 * G + 3 * M),
+    ]
+    assert s3fs.core._plan_merge_parts([G + 1]) == [
+        ("copy", 0, 0, G + 1 - M),
+        ("copy", 0, G + 1 - M, G + 1),
+    ]
+    # empty inputs produce no parts
+    assert s3fs.core._plan_merge_parts([0, 0]) == []
+    assert s3fs.core._plan_merge_parts([10]) == [("upload", [(0, 0, 10)])]
+
+
+def test_merge_mixed_sizes(s3, monkeypatch):
+    # sizes cross part boundaries in several ways: tiny files glued together,
+    # files straddling a boundary (head downloaded, tail copied server-side),
+    # whole-object copies, and a sub-minimum tail as the last part
+    sizes = [2**20, 2 * 2**20, 3 * 2**20, 12 * 2**20, 6 * 2**20, 100, 7 * 2**20, 10]
+    payloads = [random.Random(i).randbytes(n) for (i, n) in enumerate(sizes)]
+    paths = ["%s/merge-mixed/%d" % (test_bucket_name, i) for i in range(len(sizes))]
+    for path, data in zip(paths, payloads):
+        s3.pipe_file(path, data)
+
+    downloaded = 0
+    orig_call_s3 = S3FileSystem._call_s3
+
+    async def counting_call_s3(self, method, *args, **kwargs):
+        nonlocal downloaded
+        resp = await orig_call_s3(self, method, *args, **kwargs)
+        if method == "get_object":
+            downloaded += resp["ContentLength"]
+        return resp
+
+    monkeypatch.setattr(S3FileSystem, "_call_s3", counting_call_s3)
+    target = test_bucket_name + "/joined-mixed"
+    s3.merge(target, paths)
+
+    # only the boundary content that cannot be a legal part was downloaded:
+    # three full 5 MiB glued parts plus the sub-minimum tail; the 8 MiB and
+    # 6 MiB runs were copied server-side
+    assert downloaded == 3 * 5 * 2**20 + 2 * 2**20 + 110
+    # the merged object is byte-for-byte the concatenation of the inputs
+    assert s3.cat(target) == b"".join(payloads)
+
+
+def test_merge_small_files(s3):
+    payloads = [b"hello ", b"world", b"!", b""]
+    paths = ["%s/merge-small/%d" % (test_bucket_name, i) for i in range(4)]
+    for path, data in zip(paths, payloads):
+        s3.pipe_file(path, data)
+    target = test_bucket_name + "/joined-small"
+    s3.merge(target, paths)
+    assert s3.cat(target) == b"hello world!"
+
+
+def test_merge_empty_files(s3):
+    s3.pipe_file(a, b"")
+    target = test_bucket_name + "/joined-empty"
+    s3.merge(target, [a])
+    assert s3.cat(target) == b""
+    with pytest.raises(ValueError):
+        s3.merge(target, [])
+
+
+def test_merge_versioned(s3):
+    client = get_boto3_client()
+    key = "merge-versioned"
+    data_v1 = b"a" * (6 * 2**20)
+    data_v2 = b"b" * (6 * 2**20)
+    client.put_object(Bucket=versioned_bucket_name, Key=key, Body=data_v1)
+    client.put_object(Bucket=versioned_bucket_name, Key=key, Body=data_v2)
+    versions = client.list_object_versions(
+        Bucket=versioned_bucket_name, Prefix=key
+    )["Versions"]
+    version_v1 = [v for v in versions if not v["IsLatest"]][0]["VersionId"]
+
+    s3 = S3FileSystem(
+        anon=False, version_aware=True, client_kwargs={"endpoint_url": endpoint_uri}
+    )
+    target = test_bucket_name + "/joined-versioned"
+    # the copy is bound to the selected version, not the latest content
+    s3.merge(target, ["%s/%s?versionId=%s" % (versioned_bucket_name, key, version_v1)])
+    assert s3.cat(target) == data_v1
+
+
+def test_merge_source_changed_during_merge(s3, monkeypatch):
+    client = get_boto3_client()
+    data = b"a" * (6 * 2**20)
+    s3.pipe_file(a, data)
+    target = test_bucket_name + "/joined-changed"
+    s3.pipe_file(target, b"original")
+    orig_merge_part = S3FileSystem._merge_part
+
+    async def mutate_during_merge(self, *args, **kwargs):
+        result = await orig_merge_part(self, *args, **kwargs)
+        # simulate a concurrent writer changing the source mid-merge
+        client.put_object(
+            Bucket=test_bucket_name, Key="tmp/test/a", Body=b"b" * (6 * 2**20)
+        )
+        return result
+
+    monkeypatch.setattr(S3FileSystem, "_merge_part", mutate_during_merge)
+    with pytest.raises(FileExpired):
+        s3.merge(target, [a])
+    # the old target is untouched, not a half-finished merge
+    assert s3.cat(target) == b"original"
+    # the incomplete upload of this run was cleaned up
+    uploads = client.list_multipart_uploads(Bucket=test_bucket_name)
+    assert uploads.get("Uploads", []) == []
+
+
+def test_merge_failure_cleans_up(s3, monkeypatch):
+    data = b"a" * (6 * 2**20)
+    s3.pipe_file(a, data)
+    s3.pipe_file(b, data)
+    target = test_bucket_name + "/joined-failure"
+    s3.pipe_file(target, b"original")
+    orig_call_s3 = S3FileSystem._call_s3
+    copies = []
+
+    async def failing_call_s3(self, method, *args, **kwargs):
+        if method == "upload_part_copy":
+            copies.append(1)
+            if len(copies) == 2:
+                raise OSError("simulated copy failure")
+        return await orig_call_s3(self, method, *args, **kwargs)
+
+    monkeypatch.setattr(S3FileSystem, "_call_s3", failing_call_s3)
+    with pytest.raises(OSError):
+        s3.merge(target, [a, b])
+    # the old target is untouched, not a half-finished merge
+    assert s3.cat(target) == b"original"
+    # the incomplete upload of this run was cleaned up
+    uploads = get_boto3_client().list_multipart_uploads(Bucket=test_bucket_name)
+    assert uploads.get("Uploads", []) == []
+
+
 def test_append(s3):
     data = text_files["nested/file1"]
     with s3.open(test_bucket_name + "/nested/file1", "ab") as f:
