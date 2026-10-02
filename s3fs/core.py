@@ -2124,11 +2124,23 @@ class S3FileSystem(AsyncFileSystem):
 
     url = sync_wrapper(_url)
 
-    async def _merge(self, path, filelist, **kwargs):
+    async def _merge(self, path, filelist, min_part_size=5 * 2**20, **kwargs):
         """Create single S3 file from list of S3 files
 
-        Uses multi-part, no data is downloaded. The original files are
-        not deleted.
+        Uses multi-part upload. Source objects which are large enough to
+        form a legal part on their own (at least ``min_part_size`` bytes)
+        are copied server-side with ``upload_part_copy``; only boundary
+        content - consecutive sources too small to be a part of their own -
+        is downloaded, concatenated and re-uploaded from the client. The
+        final part follows S3 rules and may be of any size.
+
+        Sources are assembled in the exact order given. Every server-side
+        copy is pinned to the resolved version of its source and guarded by
+        the source ETag, and client-side downloads are pinned to the
+        resolved version (or verified by ETag when unversioned), so a
+        source object changing mid-merge fails the operation. On any
+        failure the multipart upload is aborted, and a pre-existing object
+        at ``path`` is left untouched.
 
         Parameters
         ----------
@@ -2136,40 +2148,176 @@ class S3FileSystem(AsyncFileSystem):
             The final file to produce
         filelist : list of str
             The paths, in order, to assemble into the final file.
+        min_part_size : int
+            Minimum size in bytes of a non-final part (5 MiB on S3)
         """
         bucket, key, version_id = self.split_path(path)
-        if version_id:
+        if version_id or (not self.version_aware and "?versionId=" in path):
             raise ValueError("Cannot write to an explicit versioned file!")
+        if not filelist:
+            raise ValueError("Cannot merge an empty list of files")
+
+        # Resolve every source up-front, pinning the selected version and
+        # ETag so that a source changing underneath us fails rather than
+        # silently producing a corrupt result.
+        sources = []
+        for f in filelist:
+            src_bucket, src_key, src_version = self.split_path(f)
+            if not self.version_aware and "?versionId=" in f:
+                raise ValueError(
+                    "Cannot merge explicit versioned files if the "
+                    "filesystem is not version aware"
+                )
+            info = await self._info(f, refresh=True)
+            if info["type"] != "file":
+                raise FileNotFoundError(f)
+            src_version = src_version or info.get("VersionId")
+            if src_version == "null":
+                src_version = None
+            sources.append(
+                {
+                    "bucket": src_bucket,
+                    "key": src_key,
+                    "version_id": src_version,
+                    "size": info["size"],
+                    "etag": info.get("ETag"),
+                }
+            )
+
+        # Plan the parts, preserving the input order exactly. Sources of at
+        # least min_part_size become server-side copy parts; runs of smaller
+        # sources are concatenated client-side. If such a run cannot reach
+        # min_part_size on its own and is not the final part, it borrows the
+        # leading bytes of the following large source (downloaded
+        # client-side) while the remainder of that source is still copied
+        # server-side with a range copy. Only when no legal split exists is
+        # a large source merged client-side as a whole. The final part
+        # follows S3 rules and may be of any size.
+        segments = []
+        pending = []
+        pending_size = 0
+
+        def flush_pending():
+            nonlocal pending, pending_size
+            if pending:
+                segments.append(("buffer", pending))
+                pending, pending_size = [], 0
+
+        last_index = len(sources) - 1
+        for index, src in enumerate(sources):
+            size = src["size"]
+            if size < min_part_size:
+                pending.append((src, 0, size))
+                pending_size += size
+                if pending_size >= min_part_size:
+                    flush_pending()
+                continue
+            if pending and pending_size < min_part_size:
+                needed = min_part_size - pending_size
+                remaining = size - needed
+                if remaining > 0 and (
+                    remaining >= min_part_size or index == last_index
+                ):
+                    pending.append((src, 0, needed))
+                    flush_pending()
+                    segments.append(("copy", src, needed, size))
+                    continue
+                # No legal split of this source is possible: merge the
+                # whole source client-side
+                pending.append((src, 0, size))
+                flush_pending()
+                continue
+            flush_pending()
+            segments.append(("copy", src, 0, size))
+        flush_pending()
+        if len(segments) > MAX_UPLOAD_PARTS:
+            raise ValueError(
+                "Merge would require %d parts, more than the maximum of %d"
+                % (len(segments), MAX_UPLOAD_PARTS)
+            )
+
         mpu = await self._call_s3(
             "create_multipart_upload", kwargs, Bucket=bucket, Key=key
         )
-        # TODO: Make this support versions?
-        out = await asyncio.gather(
-            *[
-                self._call_s3(
-                    "upload_part_copy",
-                    kwargs,
-                    Bucket=bucket,
-                    Key=key,
-                    UploadId=mpu["UploadId"],
-                    CopySource=f,
-                    PartNumber=i + 1,
-                )
-                for (i, f) in enumerate(filelist)
-            ]
-        )
-        parts = [
-            {"PartNumber": i + 1, "ETag": o["CopyPartResult"]["ETag"]}
-            for (i, o) in enumerate(out)
-        ]
-        part_info = {"Parts": parts}
-        await self._call_s3(
-            "complete_multipart_upload",
-            Bucket=bucket,
-            Key=key,
-            UploadId=mpu["UploadId"],
-            MultipartUpload=part_info,
-        )
+        try:
+            out = []
+            for part_number, segment in enumerate(segments, start=1):
+                if segment[0] == "copy":
+                    _, src, start, end = segment
+                    copy_source = {"Bucket": src["bucket"], "Key": src["key"]}
+                    if src["version_id"]:
+                        copy_source["VersionId"] = src["version_id"]
+                    extra = {}
+                    if src["etag"]:
+                        extra["CopySourceIfMatch"] = src["etag"]
+                    if (start, end) != (0, src["size"]):
+                        extra["CopySourceRange"] = "bytes=%d-%d" % (start, end - 1)
+                    out.append(
+                        await self._call_s3(
+                            "upload_part_copy",
+                            kwargs,
+                            Bucket=bucket,
+                            Key=key,
+                            UploadId=mpu["UploadId"],
+                            CopySource=copy_source,
+                            PartNumber=part_number,
+                            **extra,
+                        )
+                    )
+                else:
+                    chunks = []
+                    for src, start, end in segment[1]:
+                        src_path = "/".join((src["bucket"], src["key"]))
+                        if (start, end) == (0, src["size"]):
+                            data = await self._cat_file(
+                                src_path, version_id=src["version_id"]
+                            )
+                        else:
+                            data = await self._cat_file(
+                                src_path,
+                                version_id=src["version_id"],
+                                start=start,
+                                end=end,
+                            )
+                        chunks.append(data)
+                        if src["version_id"] is None and src["etag"]:
+                            # No version to pin the read to: verify the
+                            # object did not change underneath us
+                            recheck = await self._info(src_path, refresh=True)
+                            if recheck.get("ETag") != src["etag"]:
+                                raise FileExpired(
+                                    filename=src_path, e_tag=src["etag"]
+                                )
+                    out.append(
+                        await self._call_s3(
+                            "upload_part",
+                            kwargs,
+                            Bucket=bucket,
+                            Key=key,
+                            UploadId=mpu["UploadId"],
+                            PartNumber=part_number,
+                            Body=b"".join(chunks),
+                        )
+                    )
+            parts = []
+            for part_number, o in enumerate(out, start=1):
+                result = o.get("CopyPartResult", o)
+                parts.append({"PartNumber": part_number, "ETag": result["ETag"]})
+            part_info = {"Parts": parts}
+            await self._call_s3(
+                "complete_multipart_upload",
+                Bucket=bucket,
+                Key=key,
+                UploadId=mpu["UploadId"],
+                MultipartUpload=part_info,
+            )
+        except Exception:
+            # Any partial failure must not leak an unfinished upload, and
+            # the pre-existing object at path (if any) stays untouched
+            try:
+                await self._abort_mpu(bucket, key, mpu["UploadId"])
+            finally:
+                raise
         self.invalidate_cache(path)
 
     merge = sync_wrapper(_merge)

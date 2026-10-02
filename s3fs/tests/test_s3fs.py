@@ -1599,6 +1599,212 @@ def test_merge(s3):
     assert s3.info(test_bucket_name + "/joined")["size"] == 2 * 10 * 2**20
 
 
+def test_merge_small_files_across_part_boundaries(s3, monkeypatch):
+    # Sizes straddling the 5 MiB minimum part size in both directions:
+    # small runs are merged client-side, large objects are copied
+    # server-side, and one large object is split across the boundary
+    # (its head tops up a small run, its tail is range-copied).
+    sizes = [
+        3 * 2**20,  # small \
+        4 * 2**20,  # small  -> client-merged part of 7 MiB
+        6 * 2**20,  # large  -> server-side copy part
+        1 * 2**20,  # small \
+        2 * 2**20,  # small  -> client-merged part of 5 MiB, borrowing
+        7 * 2**20,  # large  -> 2 MiB from this one's head; 5 MiB tail copied
+        10,  # tiny trailing -> final part (any size allowed)
+    ]
+    contents = []
+    paths = []
+    for i, size in enumerate(sizes):
+        data = random.Random(i).randbytes(size)
+        path = f"{test_bucket_name}/merge-src/{i}"
+        s3.pipe_file(path, data)
+        contents.append(data)
+        paths.append(path)
+
+    downloaded = []
+    calls = []
+    original_cat_file = S3FileSystem._cat_file
+    original_call_s3 = S3FileSystem._call_s3
+
+    async def recording_cat_file(self, path, **kwargs):
+        data = await original_cat_file(self, path, **kwargs)
+        downloaded.append(len(data))
+        return data
+
+    async def recording_call_s3(self, method, *args, **kwargs):
+        calls.append(method)
+        return await original_call_s3(self, method, *args, **kwargs)
+
+    monkeypatch.setattr(S3FileSystem, "_cat_file", recording_cat_file)
+    monkeypatch.setattr(S3FileSystem, "_call_s3", recording_call_s3)
+
+    target = test_bucket_name + "/joined"
+    s3.merge(target, paths)
+    merge_downloaded = sum(downloaded)
+
+    # final object is byte-for-byte the concatenation of the inputs, in order
+    assert s3.cat(target) == b"".join(contents)
+    # only the boundary content was downloaded: (3+4) MiB, (1+2+2) MiB, 10 B
+    assert merge_downloaded == (3 + 4) * 2**20 + (1 + 2 + 2) * 2**20 + 10
+    # everything else was assembled server-side
+    assert calls.count("upload_part_copy") == 2
+    assert calls.count("upload_part") == 3
+    assert s3.list_multipart_uploads(test_bucket_name) == []
+
+
+def test_merge_empty_and_missing_sources(s3):
+    with pytest.raises(ValueError):
+        s3.merge(test_bucket_name + "/joined", [])
+    with pytest.raises(FileNotFoundError):
+        s3.merge(test_bucket_name + "/joined", [test_bucket_name + "/nonexistent"])
+    # nothing was even started
+    assert s3.list_multipart_uploads(test_bucket_name) == []
+
+
+def test_merge_binds_selected_version(s3):
+    client = get_boto3_client()
+    old = b"a" * 6 * 2**20
+    new = b"b" * 6 * 2**20
+    client.put_object(Bucket=versioned_bucket_name, Key="merge-big", Body=old)
+    version_id = client.head_object(Bucket=versioned_bucket_name, Key="merge-big")[
+        "VersionId"
+    ]
+    client.put_object(Bucket=versioned_bucket_name, Key="merge-big", Body=new)
+    client.put_object(Bucket=versioned_bucket_name, Key="merge-small", Body=b"tail")
+
+    fs = S3FileSystem(
+        anon=False, version_aware=True, client_kwargs={"endpoint_url": endpoint_uri}
+    )
+    big = versioned_bucket_name + "/merge-big"
+    small = versioned_bucket_name + "/merge-small"
+    # the copy is pinned to the explicitly selected version
+    fs.merge(
+        versioned_bucket_name + "/merged-old",
+        [f"{big}?versionId={version_id}", small],
+    )
+    assert fs.cat(versioned_bucket_name + "/merged-old") == old + b"tail"
+    # without a version, the current version is used
+    fs.merge(versioned_bucket_name + "/merged-new", [big, small])
+    assert fs.cat(versioned_bucket_name + "/merged-new") == new + b"tail"
+
+
+def test_merge_version_id_requires_version_aware(s3):
+    # a pinned version must never be silently dropped
+    s3.pipe_file(test_bucket_name + "/merge-src", b"data")
+    with pytest.raises(ValueError):
+        s3.merge(
+            test_bucket_name + "/joined",
+            [test_bucket_name + "/merge-src?versionId=1"],
+        )
+    with pytest.raises(ValueError):
+        s3.merge(
+            test_bucket_name + "/joined?versionId=1",
+            [test_bucket_name + "/merge-src"],
+        )
+    assert s3.list_multipart_uploads(test_bucket_name) == []
+
+
+def test_merge_failure_aborts_and_preserves_target(s3, monkeypatch):
+    big1 = test_bucket_name + "/merge-big1"
+    big2 = test_bucket_name + "/merge-big2"
+    s3.pipe_file(big1, b"a" * 6 * 2**20)
+    s3.pipe_file(big2, b"b" * 6 * 2**20)
+    target = test_bucket_name + "/joined"
+    s3.pipe_file(target, b"original")
+
+    original_call_s3 = S3FileSystem._call_s3
+
+    async def failing_call_s3(self, method, *args, **kwargs):
+        if method == "upload_part_copy" and kwargs.get("PartNumber") == 2:
+            raise OSError("simulated failure of the second part")
+        return await original_call_s3(self, method, *args, **kwargs)
+
+    monkeypatch.setattr(S3FileSystem, "_call_s3", failing_call_s3)
+    with pytest.raises(OSError):
+        s3.merge(target, [big1, big2])
+    # the unfinished upload was cleaned up and the old target is intact
+    assert s3.list_multipart_uploads(test_bucket_name) == []
+    assert s3.cat(target) == b"original"
+
+
+def test_merge_source_changed_midway_copy_fails(s3, monkeypatch):
+    # A source object changing between resolution and a server-side copy
+    # must fail the merge (S3 rejects the mismatched CopySourceIfMatch)
+    big = test_bucket_name + "/merge-big"
+    small = test_bucket_name + "/merge-small"
+    s3.pipe_file(big, b"a" * 6 * 2**20)
+    s3.pipe_file(small, b"tail")
+    target = test_bucket_name + "/joined"
+    s3.pipe_file(target, b"original")
+
+    client = get_boto3_client()
+    original_call_s3 = S3FileSystem._call_s3
+
+    async def enforcing_call_s3(self, method, *args, **kwargs):
+        if method == "create_multipart_upload":
+            out = await original_call_s3(self, method, *args, **kwargs)
+            # the source changes while the merge is in flight
+            client.put_object(Bucket=test_bucket_name, Key="merge-big", Body=b"c" * 6 * 2**20)
+            return out
+        if method == "upload_part_copy":
+            head = await original_call_s3(
+                self,
+                "head_object",
+                Bucket=kwargs["CopySource"]["Bucket"],
+                Key=kwargs["CopySource"]["Key"],
+            )
+            if head["ETag"] != kwargs.get("CopySourceIfMatch"):
+                raise botocore.exceptions.ClientError(
+                    {
+                        "Error": {
+                            "Code": "PreconditionFailed",
+                            "Message": "At least one of the pre-conditions "
+                            "you specified did not hold",
+                        }
+                    },
+                    "UploadPartCopy",
+                )
+        return await original_call_s3(self, method, *args, **kwargs)
+
+    monkeypatch.setattr(S3FileSystem, "_call_s3", enforcing_call_s3)
+    with pytest.raises(botocore.exceptions.ClientError):
+        s3.merge(target, [big, small])
+    assert s3.list_multipart_uploads(test_bucket_name) == []
+    assert s3.cat(target) == b"original"
+
+
+def test_merge_source_changed_midway_download_fails(s3, monkeypatch):
+    # Unversioned small sources are re-checked by ETag after download
+    small1 = test_bucket_name + "/merge-small1"
+    small2 = test_bucket_name + "/merge-small2"
+    s3.pipe_file(small1, b"hello")
+    s3.pipe_file(small2, b"world")
+    target = test_bucket_name + "/joined"
+    s3.pipe_file(target, b"original")
+
+    client = get_boto3_client()
+    original_call_s3 = S3FileSystem._call_s3
+    changed = False
+
+    async def changing_call_s3(self, method, *args, **kwargs):
+        nonlocal changed
+        out = await original_call_s3(self, method, *args, **kwargs)
+        if method == "get_object" and not changed:
+            changed = True
+            # the source changes between resolution and the ETag re-check
+            client.put_object(
+                Bucket=test_bucket_name, Key="merge-small1", Body="HELLO"
+            )
+        return out
+
+    monkeypatch.setattr(S3FileSystem, "_call_s3", changing_call_s3)
+    with pytest.raises(FileExpired):
+        s3.merge(target, [small1, small2])
+    assert s3.list_multipart_uploads(test_bucket_name) == []
+    assert s3.cat(target) == b"original"
+
+
 def test_append(s3):
     data = text_files["nested/file1"]
     with s3.open(test_bucket_name + "/nested/file1", "ab") as f:

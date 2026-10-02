@@ -4,6 +4,9 @@ Changelog
 Unreleased
 ----------
 
+- merge: support sources smaller than the multipart minimum part size by
+  client-side merging only the boundary content, pin copies to the selected
+  source version, and abort the upload on any partial failure
 - Raise translated errors when S3 reports per-object failures for bulk deletes (#838)
 
 2026.9.0
